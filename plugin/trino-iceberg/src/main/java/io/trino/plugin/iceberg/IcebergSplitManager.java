@@ -90,7 +90,7 @@ public class IcebergSplitManager
             Set<ColumnHandle> dynamicFilterColumns,
             Constraint constraint)
     {
-        IcebergTableHandle table = (IcebergTableHandle) handle;
+        IcebergTableHandle table = handle instanceof IcebergTableScanFilter filtered ? filtered.table() : (IcebergTableHandle) handle;
 
         if (table.getSnapshotId().isEmpty()) {
             if (table.isRecordScannedFiles()) {
@@ -121,6 +121,9 @@ public class IcebergSplitManager
                 dynamicFilterColumns,
                 evaluator);
 
+        if (handle instanceof IcebergTableScanFilter filtered) {
+            splitSource.setFileFilter(filtered.columnIds(), filtered.filter().apply(scan.schema()));
+        }
         return new ClassLoaderSafeConnectorSplitSource(splitSource, IcebergSplitManager.class.getClassLoader());
     }
 

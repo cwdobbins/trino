@@ -1,1 +1,1 @@
-${project.version}
+${trino.spi.compile-time.version}

@@ -328,6 +328,11 @@ public class EntriesTable
         }
         blockBuilder.buildEntry((keyBuilder, valueBuilder) -> values.forEach((key, value) -> {
             Type type = idToTypeMapping.get(key);
+            if (type == null) {
+                // Not a primitive column (Iceberg also records bounds for a shredded VARIANT column, in its own
+                // encoding), so there is nothing to print; the $files table omits it as well
+                return;
+            }
             INTEGER.writeLong(keyBuilder, key);
             VARCHAR.writeString(valueBuilder, Transforms.identity().toHumanString(type, Conversions.fromByteBuffer(type, value)));
         }));

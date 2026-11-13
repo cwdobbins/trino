@@ -91,6 +91,7 @@ public class TestIcebergConfig
                 .setMetadataParallelism(8)
                 .setMetadataVirtualThreadsEnabled(true)
                 .setBucketExecutionEnabled(true)
+                .setParquetShreddedVariantSelectiveRebuild(true)
                 .setParquetFooterCacheType(NONE)
                 .setParquetFooterCacheMemoryMaxSize(DataSize.of(10, MEGABYTE))
                 .setDomainCompactionThreshold(1000));
@@ -100,6 +101,7 @@ public class TestIcebergConfig
     public void testExplicitPropertyMappings()
     {
         Map<String, String> properties = ImmutableMap.<String, String>builder()
+                .put("parquet.shredded-variant-selective-rebuild", "false")
                 .put("iceberg.file-format", "ORC")
                 .put("iceberg.compression-codec", "NONE")
                 .put("iceberg.max-commit-retry", "100")
@@ -191,6 +193,7 @@ public class TestIcebergConfig
                 .setMetadataParallelism(10)
                 .setMetadataVirtualThreadsEnabled(false)
                 .setBucketExecutionEnabled(false)
+                .setParquetShreddedVariantSelectiveRebuild(false)
                 .setParquetFooterCacheType(MEMORY)
                 .setParquetFooterCacheMemoryMaxSize(DataSize.of(42, MEGABYTE))
                 .setDomainCompactionThreshold(10000);

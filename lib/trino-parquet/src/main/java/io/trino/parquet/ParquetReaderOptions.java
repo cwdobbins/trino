@@ -44,6 +44,7 @@ public class ParquetReaderOptions
     private final DataSize footerReadSize;
     private final DataSize maxFooterReadSize;
     private final DataSize maxPageReadSize;
+    private final boolean shreddedVariantSelectiveRebuild;
 
     private ParquetReaderOptions()
     {
@@ -60,6 +61,7 @@ public class ParquetReaderOptions
         footerReadSize = DEFAULT_FOOTER_READ_SIZE;
         maxFooterReadSize = DEFAULT_MAX_FOOTER_READ_SIZE;
         maxPageReadSize = DEFAULT_MAX_PAGE_READ_SIZE;
+        shreddedVariantSelectiveRebuild = false;
     }
 
     private ParquetReaderOptions(
@@ -75,7 +77,8 @@ public class ParquetReaderOptions
             boolean vectorizedDecodingEnabled,
             DataSize footerReadSize,
             DataSize maxFooterReadSize,
-            DataSize maxPageReadSize)
+            DataSize maxPageReadSize,
+            boolean shreddedVariantSelectiveRebuild)
     {
         this.ignoreStatistics = ignoreStatistics;
         this.maxReadBlockSize = requireNonNull(maxReadBlockSize, "maxReadBlockSize is null");
@@ -92,6 +95,7 @@ public class ParquetReaderOptions
         checkArgument(footerReadSize.toBytes() >= 8, "footerReadSize must be at least 8 bytes");
         this.maxFooterReadSize = requireNonNull(maxFooterReadSize, "maxFooterReadSize is null");
         this.maxPageReadSize = requireNonNull(maxPageReadSize, "maxPageReadSize is null");
+        this.shreddedVariantSelectiveRebuild = shreddedVariantSelectiveRebuild;
     }
 
     public static Builder builder()
@@ -174,6 +178,18 @@ public class ParquetReaderOptions
         return maxPageReadSize;
     }
 
+    /**
+     * Whether a top-level shredded VARIANT column read under selected positions reconstructs variants for the selected
+     * rows only. Its columns are decoded for the whole batch either way; what is skipped is reconstructing (and so
+     * decoding the variant bytes of) rows a filter already rejected, so a malformed value in such a row raises no error.
+     * Off (the default, so every connector reads as stock Trino; Iceberg turns it on by default), the column is
+     * reconstructed for every row of the batch and the selection applied afterwards.
+     */
+    public boolean shreddedVariantSelectiveRebuild()
+    {
+        return shreddedVariantSelectiveRebuild;
+    }
+
     public static class Builder
     {
         private boolean ignoreStatistics;
@@ -189,6 +205,7 @@ public class ParquetReaderOptions
         private DataSize footerReadSize;
         private DataSize maxFooterReadSize;
         private DataSize maxPageReadSize;
+        private boolean shreddedVariantSelectiveRebuild;
 
         private Builder(ParquetReaderOptions parquetReaderOptions)
         {
@@ -206,6 +223,7 @@ public class ParquetReaderOptions
             this.footerReadSize = parquetReaderOptions.footerReadSize;
             this.maxFooterReadSize = parquetReaderOptions.maxFooterReadSize;
             this.maxPageReadSize = parquetReaderOptions.maxPageReadSize;
+            this.shreddedVariantSelectiveRebuild = parquetReaderOptions.shreddedVariantSelectiveRebuild;
         }
 
         public Builder withIgnoreStatistics(boolean ignoreStatistics)
@@ -286,6 +304,12 @@ public class ParquetReaderOptions
             return this;
         }
 
+        public Builder withShreddedVariantSelectiveRebuild(boolean shreddedVariantSelectiveRebuild)
+        {
+            this.shreddedVariantSelectiveRebuild = shreddedVariantSelectiveRebuild;
+            return this;
+        }
+
         public ParquetReaderOptions build()
         {
             return new ParquetReaderOptions(
@@ -301,7 +325,8 @@ public class ParquetReaderOptions
                     vectorizedDecodingEnabled,
                     footerReadSize,
                     maxFooterReadSize,
-                    maxPageReadSize);
+                    maxPageReadSize,
+                    shreddedVariantSelectiveRebuild);
         }
     }
 }

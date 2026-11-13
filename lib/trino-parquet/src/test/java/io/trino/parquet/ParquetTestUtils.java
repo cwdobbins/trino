@@ -184,9 +184,30 @@ public class ParquetTestUtils
             DateTimeZone timeZone)
             throws IOException
     {
+        MessageType fileSchema = parquetMetadata.getFileMetaData().getSchema();
+        return createParquetReader(input, parquetMetadata, fileSchema, options, memoryContext, types, columnNames, predicate, forceSelectedPositionsPushdown, timeZone);
+    }
+
+    /**
+     * As the other overloads, reading the columns through {@code requestedSchema}, a subset of the file schema
+     * (the file schema itself reads every column as written).
+     */
+    public static ParquetReader createParquetReader(
+            ParquetDataSource input,
+            ParquetMetadata parquetMetadata,
+            MessageType requestedSchema,
+            ParquetReaderOptions options,
+            AggregatedMemoryContext memoryContext,
+            List<Type> types,
+            List<String> columnNames,
+            TupleDomain<String> predicate,
+            boolean forceSelectedPositionsPushdown,
+            DateTimeZone timeZone)
+            throws IOException
+    {
         FileMetadata fileMetaData = parquetMetadata.getFileMetaData();
         MessageType fileSchema = fileMetaData.getSchema();
-        MessageColumnIO messageColumnIO = getColumnIO(fileSchema, fileSchema);
+        MessageColumnIO messageColumnIO = getColumnIO(fileSchema, requestedSchema);
         ImmutableList.Builder<Column> columnFields = ImmutableList.builder();
         for (int i = 0; i < types.size(); i++) {
             columnFields.add(new Column(
@@ -196,10 +217,10 @@ public class ParquetTestUtils
                             lookupColumnByName(messageColumnIO, columnNames.get(i)))
                             .orElseThrow()));
         }
-        Map<List<String>, ColumnDescriptor> descriptorsByPath = getDescriptors(fileSchema, fileSchema);
+        Map<List<String>, ColumnDescriptor> descriptorsByPath = getDescriptors(fileSchema, requestedSchema);
         TupleDomain<ColumnDescriptor> parquetTupleDomain = predicate.transformKeys(
                 columnName -> descriptorsByPath.get(ImmutableList.of(columnName.toLowerCase(ENGLISH))));
-        TupleDomainParquetPredicate parquetPredicate = buildPredicate(fileSchema, parquetTupleDomain, descriptorsByPath, timeZone);
+        TupleDomainParquetPredicate parquetPredicate = buildPredicate(requestedSchema, parquetTupleDomain, descriptorsByPath, timeZone);
         List<RowGroupInfo> rowGroups = getFilteredRowGroups(
                 0,
                 input.getEstimatedSize(),

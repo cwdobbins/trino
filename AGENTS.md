@@ -1,5 +1,30 @@
 # Trino agent guidance
 
+## VARIANT feature branch
+
+Read [the tracked specification and plan](docs/variant-shredding.md) first.
+Local `docs/variant` and `docs/superpowers` are ignored context; historical
+handoffs do not supersede the tracked current guide.
+
+- Work on `variant-filter-pushdown` in this normal checkout. Discover companion
+  GeoMesa and exporter locations; do not assume a workstation path.
+- Phases 1–4 and bounded phase-5 integer/decimal, single-array-step string and
+  object-path file pruning are complete. Source-data pilot evidence supports
+  native storage for the tested workloads; production acceptance remains open.
+- Preserve stock Trino 484, patched `484-shredded-3` artifacts, toolkit marker
+  `484` for stock packaging, and separate fork/stock Maven caches. Do not bundle
+  `trino-spi` or `trino-main` or deploy core/planner/SPI Java changes.
+- Keep exact function claims distinct from conservative GeoTools candidates.
+  UNKNOWN retains rows; native hints retain engine residuals. Preserve visibility,
+  deletes, metadata safeguards, path identity, borrowed batch lifetimes and fallback.
+- Defaults remain unchanged. Sampling/client candidates/filter/projection/native
+  hints are opt-in; Iceberg selective rebuilding independently defaults to true.
+- Do not publish, push, deploy or rewrite history without a user request. The
+  current consolidation is explicitly authorized; no push is requested.
+- Keep dated source hashes and evidence immutable. History consolidation changes
+  commit identities, not validation results. Do not claim historical/full gates
+  were rerun by a documentation-only update.
+
 For other topics not covered here (Web UI build, release process, IDE setup rationale),
 see [`.github/DEVELOPMENT.md`](.github/DEVELOPMENT.md).
 

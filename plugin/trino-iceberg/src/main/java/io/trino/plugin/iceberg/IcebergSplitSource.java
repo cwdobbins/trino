@@ -61,6 +61,7 @@ import jakarta.annotation.Nullable;
 import org.apache.iceberg.BaseFileScanTask;
 import org.apache.iceberg.CombinedScanTask;
 import org.apache.iceberg.ContentFile;
+import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.MergeableScanTask;
@@ -97,6 +98,8 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
@@ -203,6 +206,12 @@ public class IcebergSplitSource
     private final SplitAffinityProvider splitAffinityProvider;
     private final InMemoryMetricsReporter metricsReporter;
     private volatile boolean finished;
+    @GuardedBy("this")
+    private Set<Integer> fileFilterColumnIds = ImmutableSet.of();
+    @GuardedBy("this")
+    private Predicate<DataFile> fileFilter = _ -> true;
+    private final AtomicLong fileFilterSkippedFiles = new AtomicLong();
+    private final AtomicLong fileFilterSkippedBytes = new AtomicLong();
 
     public IcebergSplitSource(
             IcebergFileSystemFactory fileSystemFactory,
@@ -278,6 +287,13 @@ public class IcebergSplitSource
         });
     }
 
+    synchronized void setFileFilter(Set<Integer> columnIds, Predicate<DataFile> filter)
+    {
+        checkState(fileScanIterable == null, "File planning has already started");
+        fileFilterColumnIds = ImmutableSet.copyOf(columnIds);
+        fileFilter = requireNonNull(filter, "filter is null");
+    }
+
     private synchronized List<ConnectorSplit> getNextBatchInternal(int maxSize, DynamicFilterSnapshot dynamicFilterSnapshot)
     {
         TupleDomain<IcebergColumnHandle> dynamicFilterPredicate = dynamicFilterSnapshot.currentPredicate()
@@ -297,11 +313,15 @@ public class IcebergSplitSource
 
             Expression filterExpression = toIcebergExpression(effectivePredicate);
             Scan scan = (Scan) tableScan.filter(filterExpression);
-            // Use stats to populate fileStatisticsDomain if there are predicated columns. Otherwise, skip them.
-            if (!predicatedColumnIds.isEmpty()) {
+            // File filters also need stats, independently of dynamic filters and output projection.
+            Set<Integer> statsColumnIds = ImmutableSet.<Integer>builder()
+                    .addAll(predicatedColumnIds)
+                    .addAll(fileFilterColumnIds)
+                    .build();
+            if (!statsColumnIds.isEmpty()) {
                 Schema schema = tableScan.schema();
                 scan = (Scan) scan.includeColumnStats(
-                        predicatedColumnIds.stream()
+                        statsColumnIds.stream()
                                 .map(schema::findColumnName)
                                 // Newly added column may not be found in current snapshot schema until new files are added
                                 .filter(Objects::nonNull)
@@ -406,6 +426,11 @@ public class IcebergSplitSource
     private synchronized List<FileScanTaskWithContext> processFileScanTask(TupleDomain<IcebergColumnHandle> dynamicFilterPredicate)
     {
         FileScanTask wholeFileTask = fileScanIterator.next();
+        if (!fileFilter.test(wholeFileTask.file())) {
+            fileFilterSkippedFiles.incrementAndGet();
+            fileFilterSkippedBytes.addAndGet(wholeFileTask.file().fileSizeInBytes());
+            return ImmutableList.of();
+        }
         boolean fileHasNoDeletions = wholeFileTask.deletes().isEmpty();
         FileScanTaskWithContext fileScanTaskWithDomain = createFileScanTaskWithContext(wholeFileTask, this.predicatedColumnIds);
         if (pruneFileScanTask(fileScanTaskWithDomain, fileHasNoDeletions, dynamicFilterPredicate)) {
@@ -563,6 +588,8 @@ public class IcebergSplitSource
                 .put("scanPlanningDuration", new DurationTiming(Duration.succinctDuration(scanMetrics.totalPlanningDuration().totalDuration().toMillis(), MILLISECONDS)))
                 .put("projectedFieldIds", new IntList(scanReport.projectedFieldIds()))
                 .put("dataFiles", new LongCount(scanMetrics.resultDataFiles().value()))
+                .put("fileFilterSkippedFiles", new LongCount(fileFilterSkippedFiles.get()))
+                .put("fileFilterSkippedBytes", new LongCount(fileFilterSkippedBytes.get()))
                 .put("dataFileSizeBytes", new LongCount(scanMetrics.totalFileSizeInBytes().value()))
                 .put("deleteFileSizeBytes", new LongCount(scanMetrics.totalDeleteFileSizeInBytes().value()))
                 .put("dataManifests", new LongCount(scanMetrics.scannedDataManifests().value()))
@@ -738,6 +765,12 @@ public class IcebergSplitSource
                 mayContainNulls = nullValueCount == null || nullValueCount > 0;
             }
             Type type = fieldIdToType.get(fieldId);
+            if (type == null) {
+                // Not a primitive Iceberg type (for example a VARIANT, whose file bounds are written by Iceberg
+                // in its own encoding), so the bounds mean nothing as a Trino range. The null count still applies.
+                domainBuilder.put(column, Domain.create(ValueSet.all(column.getType()), mayContainNulls));
+                continue;
+            }
             domainBuilder.put(
                     column,
                     domainForStatistics(

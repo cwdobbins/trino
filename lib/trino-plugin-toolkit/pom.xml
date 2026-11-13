@@ -5,13 +5,28 @@
     <parent>
         <groupId>io.trino</groupId>
         <artifactId>trino-root</artifactId>
-        <version>484</version>
+        <version>484-shredded-3</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
 
     <artifactId>trino-plugin-toolkit</artifactId>
     <name>${project.artifactId}</name>
     <description>Trino - Plugin Toolkit</description>
+
+    <properties>
+        <!--
+            The SPI version this toolkit records as the one plugins were compiled for. It defaults to the
+            project version, as in stock Trino, so servers started by this repository's own tests accept the
+            connectors built here.
+
+            This fork changes nothing under core/ (no SPI change), so plugins built for it can run on a stock
+            Trino server. To build artifacts for such a plugin (the owner's GeoMesa plugin), install with
+            -Pstock-spi, which records the stock release instead. A plugin built without it is refused by a
+            stock server at startup. Update the profile's value when the fork is rebased onto a new release,
+            and do not use the profile if the fork ever changes the SPI.
+        -->
+        <trino.spi.compile-time.version>${project.version}</trino.spi.compile-time.version>
+    </properties>
 
     <dependencies>
         <dependency>
@@ -234,4 +249,13 @@
             </resource>
         </resources>
     </build>
+
+    <profiles>
+        <profile>
+            <id>stock-spi</id>
+            <properties>
+                <trino.spi.compile-time.version>484</trino.spi.compile-time.version>
+            </properties>
+        </profile>
+    </profiles>
 </project>

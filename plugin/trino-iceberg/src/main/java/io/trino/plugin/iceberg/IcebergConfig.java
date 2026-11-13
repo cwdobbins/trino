@@ -109,6 +109,7 @@ public class IcebergConfig
     private int metadataParallelism = 8;
     private boolean metadataVirtualThreadsEnabled = true;
     private boolean bucketExecutionEnabled = true;
+    private boolean parquetShreddedVariantSelectiveRebuild = true;
     private ParquetFooterCacheType parquetFooterCacheType = NONE;
     private DataSize parquetFooterCacheMemoryMaxSize = DataSize.of(10, MEGABYTE);
     private int domainCompactionThreshold = 1000;
@@ -756,6 +757,19 @@ public class IcebergConfig
     public IcebergConfig setDomainCompactionThreshold(int domainCompactionThreshold)
     {
         this.domainCompactionThreshold = domainCompactionThreshold;
+        return this;
+    }
+
+    public boolean isParquetShreddedVariantSelectiveRebuild()
+    {
+        return parquetShreddedVariantSelectiveRebuild;
+    }
+
+    @Config("parquet.shredded-variant-selective-rebuild")
+    @ConfigDescription("Reconstruct a shredded VARIANT column only for the rows that survive filtering; a corrupt value in a row a filter rejected is then not decoded and raises no error")
+    public IcebergConfig setParquetShreddedVariantSelectiveRebuild(boolean parquetShreddedVariantSelectiveRebuild)
+    {
+        this.parquetShreddedVariantSelectiveRebuild = parquetShreddedVariantSelectiveRebuild;
         return this;
     }
 }

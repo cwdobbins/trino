@@ -13,6 +13,7 @@
  */
 package io.trino.plugin.iceberg;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
 import com.google.common.base.Splitter.MapSplitter;
@@ -3934,6 +3935,15 @@ public class IcebergMetadata
             return Optional.empty();
         }
 
+        return projectColumns((IcebergTableHandle) handle, projections, assignments);
+    }
+
+    @VisibleForTesting
+    static Optional<ProjectionApplicationResult<ConnectorTableHandle>> projectColumns(
+            IcebergTableHandle icebergTableHandle,
+            List<ConnectorExpression> projections,
+            Map<String, ColumnHandle> assignments)
+    {
         // Create projected column representations for supported sub expressions. Simple column references and chain of
         // dereferences on a variable are supported right now.
         Set<ConnectorExpression> projectedExpressions = projections.stream()
@@ -3942,8 +3952,6 @@ public class IcebergMetadata
 
         Map<ConnectorExpression, ProjectedColumnRepresentation> columnProjections = projectedExpressions.stream()
                 .collect(toImmutableMap(identity(), ApplyProjectionUtil::createProjectedColumnRepresentation));
-
-        IcebergTableHandle icebergTableHandle = (IcebergTableHandle) handle;
 
         // all references are simple variables
         if (columnProjections.values().stream().allMatch(ProjectedColumnRepresentation::isVariable)) {
@@ -3967,7 +3975,9 @@ public class IcebergMetadata
                     false));
         }
 
-        Map<String, Assignment> newAssignments = new HashMap<>();
+        // Read semantics include the VARIANT path set, even when the physical name is identical.
+        Map<IcebergColumnHandle, Assignment> newAssignments = new LinkedHashMap<>();
+        Set<String> assignedNames = new HashSet<>();
         ImmutableMap.Builder<ConnectorExpression, Variable> newVariablesBuilder = ImmutableMap.builder();
         ImmutableSet.Builder<IcebergColumnHandle> projectedColumnsBuilder = ImmutableSet.builder();
 
@@ -3977,13 +3987,17 @@ public class IcebergMetadata
 
             IcebergColumnHandle baseColumnHandle = (IcebergColumnHandle) assignments.get(projectedColumn.getVariable().getName());
             IcebergColumnHandle projectedColumnHandle = createProjectedColumnHandle(baseColumnHandle, projectedColumn.getDereferenceIndices(), expression.getType());
-            String projectedColumnName = projectedColumnHandle.getQualifiedName();
+            Assignment assignment = newAssignments.computeIfAbsent(projectedColumnHandle, column -> {
+                String baseName = column.getQualifiedName();
+                String name = baseName;
+                int suffix = 0;
+                while (!assignedNames.add(name)) {
+                    name = baseName + "$" + ++suffix;
+                }
+                return new Assignment(name, column, expression.getType());
+            });
 
-            Variable projectedColumnVariable = new Variable(projectedColumnName, expression.getType());
-            Assignment newAssignment = new Assignment(projectedColumnName, projectedColumnHandle, expression.getType());
-            newAssignments.putIfAbsent(projectedColumnName, newAssignment);
-
-            newVariablesBuilder.put(expression, projectedColumnVariable);
+            newVariablesBuilder.put(expression, new Variable(assignment.getVariable(), expression.getType()));
             projectedColumnsBuilder.add(projectedColumnHandle);
         }
 

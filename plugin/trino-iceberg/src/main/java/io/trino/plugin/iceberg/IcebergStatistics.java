@@ -122,12 +122,18 @@ public record IcebergStatistics(
                     }
                 }
                 else {
-                    Object lowerBound = convertIcebergValueToTrino(
-                            column.type(),
-                            Conversions.fromByteBuffer(column.type(), Optional.ofNullable(dataFile.lowerBounds()).map(a -> a.get(id)).orElse(null)));
-                    Object upperBound = convertIcebergValueToTrino(
-                            column.type(),
-                            Conversions.fromByteBuffer(column.type(), Optional.ofNullable(dataFile.upperBounds()).map(a -> a.get(id)).orElse(null)));
+                    // Bounds exist only for primitive columns that Trino can read. Iceberg also writes them for a
+                    // shredded VARIANT column, in its own encoding, which is not a range of anything Trino compares.
+                    Object lowerBound = null;
+                    Object upperBound = null;
+                    if (column.type().isPrimitiveType()) {
+                        lowerBound = convertIcebergValueToTrino(
+                                column.type(),
+                                Conversions.fromByteBuffer(column.type(), Optional.ofNullable(dataFile.lowerBounds()).map(a -> a.get(id)).orElse(null)));
+                        upperBound = convertIcebergValueToTrino(
+                                column.type(),
+                                Conversions.fromByteBuffer(column.type(), Optional.ofNullable(dataFile.upperBounds()).map(a -> a.get(id)).orElse(null)));
+                    }
                     OptionalLong nullCount = (nullValueCounts == null || !nullValueCounts.containsKey(id)) ? OptionalLong.empty() : OptionalLong.of(nullValueCounts.get(id));
                     updateMinMaxStats(
                             id,

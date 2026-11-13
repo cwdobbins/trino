@@ -26,6 +26,14 @@
   /></a>
 </p>
 
+## VARIANT feature branch
+
+The bounded reader, writer, execution and pruning implementation is complete on
+`variant-filter-pushdown`. See the [current specification, validation and remaining
+plan](docs/variant-shredding.md). Pair this checkout with the matching Trino/GeoMesa
+and exporter branches. Source-data measurements support retaining native storage
+for the tested workloads; production enablement remains a separate decision.
+
 ## Development
 
 See [DEVELOPMENT](.github/DEVELOPMENT.md) for information about development and release process,

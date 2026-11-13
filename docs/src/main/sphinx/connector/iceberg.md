@@ -317,6 +317,34 @@ implementation is used:
   - AWS secret key for KMS authentication. When set,
     `aws.kms.access-key` must also be set.
   -
+* - `parquet.shredded-variant-selective-rebuild`
+  - When `true`, the connector reconstructs a shredded Parquet `VARIANT` column only for the rows that a filter
+    keeps. A corrupt shredded value in a row that the filter rejected is then
+    never decoded and raises no error, while a kept row with a corrupt value still
+    fails. Turn it off to reconstruct the variant of every row, so that such a
+    value is always reported. The equivalent catalog session
+    property is `parquet_shredded_variant_selective_rebuild`.
+  - `true`
+:::
+
+(iceberg-session-properties)=
+### Session properties
+
+:::{list-table} Iceberg session properties
+:widths: 30, 50, 20
+:header-rows: 1
+
+* - Property name
+  - Description
+  - Default
+* - `parquet_shredded_variant_selective_rebuild`
+  - When `true`, the connector reconstructs a shredded Parquet `VARIANT` column only for the rows that a filter
+    keeps. A corrupt shredded value in a row that the filter rejected is then
+    never decoded and raises no error, while a kept row with a corrupt value still
+    fails. Turn it off to reconstruct the variant of every row, so that such a
+    value is always reported. The default is the value of the
+    `parquet.shredded-variant-selective-rebuild` catalog property.
+  - `true`
 :::
 
 (iceberg-fte-support)=

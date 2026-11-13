@@ -44,6 +44,11 @@ import io.trino.parquet.ParquetCorruptionException;
 import io.trino.parquet.ParquetDataSource;
 import io.trino.parquet.ParquetDataSourceId;
 import io.trino.parquet.ParquetReaderOptions;
+import io.trino.parquet.ShreddedLayoutException;
+import io.trino.parquet.ShreddedVariantField;
+import io.trino.parquet.ShreddedVariantPruning;
+import io.trino.parquet.VariantPath;
+import io.trino.parquet.VariantPredicateField;
 import io.trino.parquet.cache.ParquetFooterCache;
 import io.trino.parquet.cache.ParquetFooterCacheKey;
 import io.trino.parquet.crypto.DecryptionKeyRetriever;
@@ -199,6 +204,7 @@ import static io.trino.plugin.iceberg.IcebergSessionProperties.getParquetSmallFi
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isOrcBloomFiltersEnabled;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isOrcNestedLazy;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isParquetIgnoreStatistics;
+import static io.trino.plugin.iceberg.IcebergSessionProperties.isParquetShreddedVariantSelectiveRebuild;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isParquetUseColumnIndex;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isParquetVectorizedDecodingEnabled;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.isUseFileSizeFromMetadata;
@@ -218,9 +224,11 @@ import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
 import static io.trino.spi.type.TimeZoneKey.UTC_KEY;
+import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.TypeUtils.containsType;
 import static io.trino.spi.type.TypeUtils.writeNativeValue;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
+import static io.trino.spi.type.VariantType.VARIANT;
 import static java.lang.Math.addExact;
 import static java.lang.Math.min;
 import static java.lang.Math.toIntExact;
@@ -322,9 +330,6 @@ public class IcebergPageSourceProvider
         }
 
         IcebergSplit split = (IcebergSplit) connectorSplit;
-        List<IcebergColumnHandle> icebergColumns = columns.stream()
-                .map(IcebergColumnHandle.class::cast)
-                .collect(toImmutableList());
         IcebergTableHandle tableHandle = (IcebergTableHandle) connectorTable;
         Schema schema = SchemaParser.fromJson(tableHandle.getTableSchemaJson());
         String partitionSpecJson = tableHandle.getPartitionSpecJsons().get(split.specId());
@@ -335,7 +340,7 @@ public class IcebergPageSourceProvider
 
         return createPageSource(
                 session,
-                icebergColumns,
+                columns,
                 schema,
                 partitionSpec,
                 PartitionData.fromBlocks(split.partitionValues(), partitionColumnTypes, typeManager),
@@ -359,7 +364,7 @@ public class IcebergPageSourceProvider
 
     public ConnectorPageSource createPageSource(
             ConnectorSession session,
-            List<IcebergColumnHandle> icebergColumns,
+            List<? extends ColumnHandle> requestedColumns,
             Schema tableSchema,
             PartitionSpec partitionSpec,
             PartitionData partitionData,
@@ -380,6 +385,16 @@ public class IcebergPageSourceProvider
             AggregatedMemoryContext memoryContext,
             Optional<ParquetFileDecryptionData> parquetFileDecryptionData)
     {
+        List<IcebergColumnHandle> icebergColumns = new ArrayList<>();
+        List<IcebergVariantPredicateColumn> variantPredicates = new ArrayList<>();
+        for (ColumnHandle column : requestedColumns) {
+            if (column instanceof IcebergVariantPredicateColumn predicate) {
+                variantPredicates.add(predicate);
+            }
+            else {
+                icebergColumns.add((IcebergColumnHandle) column);
+            }
+        }
         Map<Integer, Optional<String>> partitionKeys = getPartitionKeys(partitionData, partitionSpec);
         TupleDomain<IcebergColumnHandle> effectivePredicate = getUnenforcedPredicate(
                 tableSchema,
@@ -398,7 +413,7 @@ public class IcebergPageSourceProvider
                 ? fileSystem.newInputFile(Location.of(path), fileSize)
                 : fileSystem.newInputFile(Location.of(path));
         try {
-            if (effectivePredicate.isAll() &&
+            if (variantPredicates.isEmpty() && effectivePredicate.isAll() &&
                     start == 0 && length == inputFile.length() &&
                     deletes.isEmpty() &&
                     icebergColumns.stream().allMatch(column -> partitionKeys.containsKey(column.getId()))) {
@@ -415,8 +430,10 @@ public class IcebergPageSourceProvider
         List<IcebergColumnHandle> requiredColumns = new ArrayList<>(icebergColumns);
 
         Set<IcebergColumnHandle> deleteFilterRequiredColumns = requiredColumnsForDeletes(tableSchema, deletes);
-        // compare by field id not handle; IcebergColumnHandle can differ when fields have comments
+        // Compare by field ID, since comments can differ. A restricted VARIANT does not satisfy
+        // a whole-value delete key: append the whole handle so physical demand absorbs its paths.
         Set<Integer> projectedIds = icebergColumns.stream()
+                .filter(column -> column.getVariantPaths().isEmpty())
                 .map(IcebergColumnHandle::getId)
                 .collect(toImmutableSet());
         deleteFilterRequiredColumns.stream()
@@ -442,7 +459,8 @@ public class IcebergPageSourceProvider
                 dataSequenceNumber,
                 fileFirstRowId,
                 memoryContext.newAggregatedMemoryContext(),
-                parquetFileDecryptionProperties);
+                parquetFileDecryptionProperties,
+                variantPredicates);
 
         ConnectorPageSource pageSource = readerPageSourceWithRowPositions.pageSource();
 
@@ -468,7 +486,7 @@ public class IcebergPageSourceProvider
                 try {
                     Optional<PageFilter> pageFilter = deletePredicate.get();
                     pageFilter.ifPresent(filter -> filter.applyFilter(page));
-                    if (icebergColumns.size() == page.getChannelCount()) {
+                    if (!variantPredicates.isEmpty() || icebergColumns.size() == page.getChannelCount()) {
                         return page;
                     }
                     return new PrefixColumnsSourcePage(page, icebergColumns.size());
@@ -478,6 +496,17 @@ public class IcebergPageSourceProvider
                     throw new TrinoException(ICEBERG_BAD_DATA, e);
                 }
             });
+        }
+        if (!variantPredicates.isEmpty()) {
+            // Delete filters see only real data columns. Decision channels follow those columns,
+            // then this mapping restores the caller's interleaved logical request order.
+            TransformConnectorPageSource.Builder outputs = TransformConnectorPageSource.builder().forceTransforms();
+            int ordinaryChannel = 0;
+            int predicateChannel = requiredColumns.size();
+            for (ColumnHandle column : requestedColumns) {
+                outputs.column(column instanceof IcebergVariantPredicateColumn ? predicateChannel++ : ordinaryChannel++);
+            }
+            pageSource = outputs.build(pageSource);
         }
         return pageSource;
     }
@@ -628,7 +657,8 @@ public class IcebergPageSourceProvider
                 OptionalLong.empty(),
                 OptionalLong.empty(),
                 memoryContext,
-                createParquetFileDecryptionProperties(delete.parquetFileDecryptionData(), arePlaintextFilesAllowedForEncryptedTables(session)))
+                createParquetFileDecryptionProperties(delete.parquetFileDecryptionData(), arePlaintextFilesAllowedForEncryptedTables(session)),
+                ImmutableList.of())
                 .pageSource();
     }
 
@@ -650,9 +680,15 @@ public class IcebergPageSourceProvider
             OptionalLong dataSequenceNumber,
             OptionalLong fileFirstRowId,
             AggregatedMemoryContext memoryContext,
-            Optional<FileDecryptionProperties> parquetFileDecryptionProperties)
+            Optional<FileDecryptionProperties> parquetFileDecryptionProperties,
+            List<IcebergVariantPredicateColumn> variantPredicates)
     {
-        return switch (fileFormat) {
+        List<IcebergColumnHandle> formatColumns = dataColumns;
+        if (fileFormat != IcebergFileFormat.PARQUET && !variantPredicates.isEmpty()) {
+            formatColumns = ImmutableList.<IcebergColumnHandle>builder().addAll(dataColumns)
+                    .addAll(variantPredicates.stream().map(IcebergVariantPredicateColumn::source).collect(toImmutableList())).build();
+        }
+        ReaderPageSourceWithRowPositions result = switch (fileFormat) {
             case ORC -> createOrcPageSource(
                     inputFile,
                     start,
@@ -660,7 +696,7 @@ public class IcebergPageSourceProvider
                     partitionSpecId,
                     partitionData,
                     fileSchema,
-                    dataColumns,
+                    formatColumns,
                     predicate,
                     domainCompactionThreshold,
                     orcReaderOptions
@@ -688,7 +724,7 @@ public class IcebergPageSourceProvider
                     partitionSpecId,
                     partitionData,
                     fileSchema,
-                    dataColumns,
+                    formatColumns,
                     ParquetReaderOptions.builder(parquetReaderOptions)
                             .withMaxReadBlockSize(getParquetMaxReadBlockSize(session))
                             .withMaxReadBlockRowCount(getParquetMaxReadBlockRowCount(session))
@@ -697,6 +733,7 @@ public class IcebergPageSourceProvider
                             .withBloomFilter(useParquetBloomFilter(session))
                             .withUseColumnIndex(isParquetUseColumnIndex(session))
                             .withVectorizedDecodingEnabled(isParquetVectorizedDecodingEnabled(session))
+                            .withShreddedVariantSelectiveRebuild(isParquetShreddedVariantSelectiveRebuild(session))
                             .build(),
                     predicate,
                     domainCompactionThreshold,
@@ -708,7 +745,8 @@ public class IcebergPageSourceProvider
                     dataSequenceNumber,
                     fileFirstRowId,
                     memoryContext,
-                    parquetFileDecryptionProperties);
+                    parquetFileDecryptionProperties,
+                    variantPredicates);
             case AVRO -> createAvroPageSource(
                     inputFile,
                     start,
@@ -718,13 +756,25 @@ public class IcebergPageSourceProvider
                     fileSchema,
                     nameMapping,
                     partition,
-                    dataColumns,
+                    formatColumns,
                     partitionKeys,
                     typeManager,
                     dataSequenceNumber,
                     fileFirstRowId,
                     memoryContext);
         };
+        if (fileFormat == IcebergFileFormat.PARQUET || variantPredicates.isEmpty()) {
+            return result;
+        }
+        TransformConnectorPageSource.Builder outputs = TransformConnectorPageSource.builder();
+        for (int channel = 0; channel < dataColumns.size(); channel++) {
+            outputs.column(channel);
+        }
+        for (int index = 0; index < variantPredicates.size(); index++) {
+            IcebergVariantPredicateColumn request = variantPredicates.get(index);
+            outputs.transform(dataColumns.size() + index, block -> referenceDecisions(request, block));
+        }
+        return new ReaderPageSourceWithRowPositions(outputs.build(result.pageSource()), result.startRowPosition(), result.endRowPosition());
     }
 
     private static ConnectorPageSource generatePages(
@@ -1117,6 +1167,16 @@ public class IcebergPageSourceProvider
         }
     }
 
+    private static Block referenceDecisions(IcebergVariantPredicateColumn predicate, Block values)
+    {
+        BlockBuilder result = TINYINT.createBlockBuilder(null, values.getPositionCount());
+        for (int position = 0; position < values.getPositionCount(); position++) {
+            TINYINT.writeLong(result, requireNonNull(predicate.evaluator().evaluateReference(
+                    values.isNull(position) ? null : VARIANT.getObject(values, position)), "decision is null").code());
+        }
+        return result.build();
+    }
+
     private static ReaderPageSourceWithRowPositions createParquetPageSource(
             TrinoInputFile inputFile,
             long start,
@@ -1137,7 +1197,8 @@ public class IcebergPageSourceProvider
             OptionalLong dataSequenceNumber,
             OptionalLong fileFirstRowId,
             AggregatedMemoryContext memoryContext,
-            Optional<FileDecryptionProperties> parquetFileDecryptionProperties)
+            Optional<FileDecryptionProperties> parquetFileDecryptionProperties,
+            List<IcebergVariantPredicateColumn> variantPredicates)
     {
         ParquetDataSource dataSource = null;
         try {
@@ -1153,17 +1214,20 @@ public class IcebergPageSourceProvider
             // Mapping from Iceberg field ID to Parquet fields.
             Map<Integer, org.apache.parquet.schema.Type> parquetIdToFieldName = createParquetIdToFieldMapping(fileSchema);
 
-            List<IcebergColumnHandle> columnsForRead = columns;
+            List<IcebergColumnHandle> columnsForRead = ImmutableList.<IcebergColumnHandle>builder().addAll(columns)
+                    .addAll(variantPredicates.stream().map(IcebergVariantPredicateColumn::source).collect(toImmutableList())).build();
             if (columns.stream().anyMatch(IcebergColumnHandle::isMergeRowIdColumn) &&
                     columns.stream().noneMatch(IcebergColumnHandle::isRowIdColumn) &&
                     parquetIdToFieldName.containsKey(IcebergMetadataColumn.ROW_ID.getId())) {
                 columnsForRead = ImmutableList.<IcebergColumnHandle>builder()
-                        .addAll(columns)
+                        .addAll(columnsForRead)
                         .add(IcebergColumnHandle.rowIdColumnHandle())
                         .build();
             }
 
-            MessageType requestedSchema = getMessageType(columnsForRead, fileSchema.getName(), parquetIdToFieldName);
+            // the requested schema is the only place a variant path set is applied, and the reader's fields are built from it,
+            // so the two cannot disagree
+            MessageType requestedSchema = buildRequestedSchema(columnsForRead, fileSchema.getName(), parquetIdToFieldName);
             Map<List<String>, ColumnDescriptor> descriptorsByPath = getDescriptors(fileSchema, requestedSchema);
             TupleDomain<ColumnDescriptor> parquetTupleDomain = options.isIgnoreStatistics() ? TupleDomain.all() : getParquetTupleDomain(descriptorsByPath, effectivePredicate);
             TupleDomainParquetPredicate parquetPredicate = buildPredicate(requestedSchema, parquetTupleDomain, descriptorsByPath, UTC);
@@ -1280,6 +1344,33 @@ public class IcebergPageSourceProvider
                 }
             }
 
+            for (IcebergVariantPredicateColumn predicate : variantPredicates) {
+                IcebergColumnHandle source = predicate.source();
+                org.apache.parquet.schema.Type parquetType = parquetIdToFieldName.get(source.getId());
+                if (parquetType == null) {
+                    Object initialDefault = getInitialDefault(tableSchema, source.getId());
+                    transforms.transform(page -> referenceDecisions(
+                            predicate,
+                            RunLengthEncodedBlock.create(writeNativeValue(VARIANT, initialDefault), page.getPositionCount())));
+                    continue;
+                }
+                // A separate logical schema view is essential: whole outputs must not force all
+                // sibling leaves to be decoded before a predicate. The physical reader interns aliases.
+                MessageType predicateSchema = buildRequestedSchema(ImmutableList.of(source), fileSchema.getName(), parquetIdToFieldName);
+                MessageColumnIO predicateColumnIO = getColumnIO(fileSchema, predicateSchema);
+                Optional<Field> sourceField = IcebergParquetColumnIOConverter.constructField(
+                        new FieldContext(source.getType(), source.getColumnIdentity()), predicateColumnIO.getChild(parquetType.getName()));
+                if (sourceField.isEmpty()) {
+                    Object initialDefault = getInitialDefault(tableSchema, source.getId());
+                    transforms.transform(page -> referenceDecisions(
+                            predicate,
+                            RunLengthEncodedBlock.create(writeNativeValue(VARIANT, initialDefault), page.getPositionCount())));
+                    continue;
+                }
+                parquetColumnFieldsBuilder.add(new Column(parquetType.getName(), new VariantPredicateField(sourceField.orElseThrow(), predicate.evaluator())));
+                transforms.column(nextOrdinal++);
+            }
+
             List<RowGroupInfo> rowGroups = getFilteredRowGroups(
                     start,
                     length,
@@ -1291,6 +1382,14 @@ public class IcebergPageSourceProvider
                     UTC,
                     domainCompactionThreshold,
                     options);
+            if (!options.isIgnoreStatistics() && !variantPredicates.isEmpty()) {
+                rowGroups = rowGroups.stream()
+                        .filter(rowGroup -> variantPredicates.stream().noneMatch(predicate -> predicate.evaluator().cannotMatchRowGroup(
+                                predicate.source().getQualifiedName(),
+                                rowGroup.prunedBlockMetadata().getRowCount(),
+                                rowGroup.prunedBlockMetadata().getColumns())))
+                        .toList();
+            }
 
             ParquetDataSourceId dataSourceId = dataSource.getId();
             ParquetReader parquetReader = new ParquetReader(
@@ -1333,6 +1432,10 @@ public class IcebergPageSourceProvider
                 if (!e.equals(ex)) {
                     e.addSuppressed(ex);
                 }
+            }
+            if (e instanceof ShreddedLayoutException layoutException) {
+                // a shredded layout refused while the reader is built: layouts differ from file to file, so name the file
+                throw layoutException.inFile(inputFile.location().toString());
             }
             if (e instanceof TrinoException trinoException) {
                 throw trinoException;
@@ -1412,10 +1515,63 @@ public class IcebergPageSourceProvider
         }
     }
 
-    private static MessageType getMessageType(List<IcebergColumnHandle> regularColumns, String fileSchemaName, Map<Integer, org.apache.parquet.schema.Type> parquetIdToField)
+    /**
+     * The Parquet schema requested from a file for these columns, computed with the page source's own {@link #buildRequestedSchema}.
+     */
+    @VisibleForTesting
+    static MessageType getRequestedSchema(List<IcebergColumnHandle> columns, MessageType fileSchema)
     {
-        return projectSufficientColumns(regularColumns).stream()
-                .map(column -> getColumnType(column, parquetIdToField))
+        return buildRequestedSchema(columns, fileSchema.getName(), createParquetIdToFieldMapping(fileSchema));
+    }
+
+    /**
+     * The one composition from the columns a Parquet page source reads to the schema it requests: the per-field-id variant path
+     * sets ({@link #variantPathsToRead}) are computed once here, and the pruned groups are built from them.
+     */
+    private static MessageType buildRequestedSchema(List<IcebergColumnHandle> columns, String fileSchemaName, Map<Integer, org.apache.parquet.schema.Type> parquetIdToField)
+    {
+        return getMessageType(columns, fileSchemaName, parquetIdToField, variantPathsToRead(columns));
+    }
+
+    /**
+     * The path set to read for each top-level VARIANT field id that carries one: a field id is read whole (and is absent from the
+     * result) if any handle on it has no path set; otherwise it is read restricted to the normalized union of its handles' path
+     * sets. Every handle on the field id is then served from that one read.
+     */
+    private static Map<Integer, Set<VariantPath>> variantPathsToRead(List<IcebergColumnHandle> columns)
+    {
+        if (columns.stream().allMatch(column -> column.getVariantPaths().isEmpty())) {
+            return ImmutableMap.of();
+        }
+        Map<Integer, List<IcebergColumnHandle>> handlesById = columns.stream()
+                .collect(groupingBy(column -> column.getBaseColumn().getId()));
+        ImmutableMap.Builder<Integer, Set<VariantPath>> result = ImmutableMap.builder();
+        handlesById.forEach((id, handles) -> {
+            if (handles.stream().allMatch(handle -> handle.getVariantPaths().isPresent())) {
+                result.put(id, VariantPath.normalize(handles.stream()
+                        .flatMap(handle -> handle.getVariantPaths().orElseThrow().stream())
+                        .collect(toImmutableList())));
+            }
+        });
+        return result.buildOrThrow();
+    }
+
+    private static MessageType getMessageType(
+            List<IcebergColumnHandle> regularColumns,
+            String fileSchemaName,
+            Map<Integer, org.apache.parquet.schema.Type> parquetIdToField,
+            Map<Integer, Set<VariantPath>> variantPathsById)
+    {
+        List<IcebergColumnHandle> columns = regularColumns;
+        if (columns.stream().anyMatch(column -> column.getVariantPaths().isPresent())) {
+            // handles that differ only by their path set are one reader column; the path set to read comes from variantPathsById
+            columns = columns.stream()
+                    .map(IcebergColumnHandle::withoutVariantPaths)
+                    .distinct()
+                    .collect(toImmutableList());
+        }
+        return projectSufficientColumns(columns).stream()
+                .map(column -> getColumnType(column, parquetIdToField, variantPathsById))
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .map(type -> new MessageType(fileSchemaName, type))
@@ -1775,9 +1931,19 @@ public class IcebergPageSourceProvider
         return sufficientColumns;
     }
 
-    private static Optional<org.apache.parquet.schema.Type> getColumnType(IcebergColumnHandle column, Map<Integer, org.apache.parquet.schema.Type> parquetIdToField)
+    private static Optional<org.apache.parquet.schema.Type> getColumnType(
+            IcebergColumnHandle column,
+            Map<Integer, org.apache.parquet.schema.Type> parquetIdToField,
+            Map<Integer, Set<VariantPath>> variantPathsById)
     {
         Optional<org.apache.parquet.schema.Type> baseColumnType = Optional.ofNullable(parquetIdToField.get(column.getBaseColumn().getId()));
+        Set<VariantPath> variantPaths = variantPathsById.get(column.getBaseColumn().getId());
+        if (variantPaths != null && column.isBaseColumn() && baseColumnType.isPresent() &&
+                !baseColumnType.get().isPrimitive() && baseColumnType.get().asGroupType().containsField(ShreddedVariantField.TYPED_VALUE)) {
+            // a top-level column, so its Parquet column path is its name; a layout error names it as the reader does
+            GroupType variantGroup = baseColumnType.get().asGroupType();
+            return Optional.of(ShreddedVariantPruning.prune(variantGroup.getName(), variantGroup, variantPaths));
+        }
         if (baseColumnType.isEmpty() || column.getPath().isEmpty()) {
             return baseColumnType;
         }

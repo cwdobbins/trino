@@ -88,6 +88,7 @@ public final class IcebergSessionProperties
     private static final String PARQUET_SMALL_FILE_THRESHOLD = "parquet_small_file_threshold";
     private static final String PARQUET_IGNORE_STATISTICS = "parquet_ignore_statistics";
     private static final String PARQUET_VECTORIZED_DECODING_ENABLED = "parquet_vectorized_decoding_enabled";
+    public static final String PARQUET_SHREDDED_VARIANT_SELECTIVE_REBUILD = "parquet_shredded_variant_selective_rebuild";
     private static final String PARQUET_WRITER_ROW_GROUP_MAX_ROW_COUNT = "parquet_writer_row_group_max_row_count";
     private static final String PARQUET_WRITER_PAGE_SIZE = "parquet_writer_page_size";
     private static final String PARQUET_WRITER_PAGE_VALUE_COUNT = "parquet_writer_page_value_count";
@@ -264,6 +265,11 @@ public final class IcebergSessionProperties
                         PARQUET_VECTORIZED_DECODING_ENABLED,
                         "Enable using Java Vector API for faster decoding of parquet files",
                         parquetReaderConfig.isVectorizedDecodingEnabled(),
+                        false))
+                .add(booleanProperty(
+                        PARQUET_SHREDDED_VARIANT_SELECTIVE_REBUILD,
+                        "Reconstruct a shredded VARIANT column only for the rows that survive filtering; a malformed value in a rejected row is then not decoded",
+                        icebergConfig.isParquetShreddedVariantSelectiveRebuild(),
                         false))
                 .add(integerProperty(
                         PARQUET_WRITER_ROW_GROUP_MAX_ROW_COUNT,
@@ -543,6 +549,11 @@ public final class IcebergSessionProperties
     public static boolean isParquetVectorizedDecodingEnabled(ConnectorSession session)
     {
         return session.getProperty(PARQUET_VECTORIZED_DECODING_ENABLED, Boolean.class);
+    }
+
+    public static boolean isParquetShreddedVariantSelectiveRebuild(ConnectorSession session)
+    {
+        return session.getProperty(PARQUET_SHREDDED_VARIANT_SELECTIVE_REBUILD, Boolean.class);
     }
 
     public static DataSize getParquetWriterPageSize(ConnectorSession session)

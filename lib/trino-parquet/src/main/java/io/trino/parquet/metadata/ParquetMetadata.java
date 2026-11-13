@@ -117,7 +117,8 @@ public class ParquetMetadata
         List<SchemaElement> schema = parquetMetadata.getSchema();
         validateParquet(!schema.isEmpty(), dataSourceId, "Schema is empty");
 
-        MessageType messageType = readParquetSchema(schema);
+        Set<List<String>> variantPaths = new HashSet<>();
+        MessageType messageType = readParquetSchema(schema, variantPaths);
         List<BlockMetadata> blocks = new ArrayList<>();
         List<RowGroup> rowGroups = parquetMetadata.getRow_groups();
 
@@ -148,7 +149,7 @@ public class ParquetMetadata
                     if (cryptoMetaData == null) {
                         // Plaintext column
                         metaData = columnChunk.getMeta_data();
-                        columnPath = getPath(metaData.getPath_in_schema());
+                        columnPath = getPath(variantPaths, metaData.getPath_in_schema());
                         decryptionContext.ifPresent(context -> context.initPlaintextColumn(columnPath));
                     }
                     else {
@@ -157,13 +158,13 @@ public class ParquetMetadata
                             // Column encrypted with footer key
                             validateParquetCrypto(columnChunk.getMeta_data() != null, dataSourceId, "Column metadata is null");
                             metaData = columnChunk.getMeta_data();
-                            columnPath = getPath(metaData.getPath_in_schema());
+                            columnPath = getPath(variantPaths, metaData.getPath_in_schema());
                             decryptionContext.get().initializeColumnCryptoMetadata(columnPath, true, Optional.empty());
                         }
                         else {
                             // Column encrypted with column key
                             EncryptionWithColumnKey columnKeyStruct = cryptoMetaData.getENCRYPTION_WITH_COLUMN_KEY();
-                            columnPath = getPath(columnKeyStruct.getPath_in_schema());
+                            columnPath = getPath(variantPaths, columnKeyStruct.getPath_in_schema());
                             Optional<ColumnMetaData> decryptedMetadata = decryptColumnMetadata(columnPath, rowGroup, columnKeyStruct.getKey_metadata(), columnChunk, decryptionContext.get(), columnOrdinal);
                             if (decryptedMetadata.isEmpty()) {
                                 // User does not have access to the column key. Column is considered hidden.
@@ -227,23 +228,33 @@ public class ParquetMetadata
         return column.getStartingPos();
     }
 
-    private static MessageType readParquetSchema(List<SchemaElement> schema)
+    private static MessageType readParquetSchema(List<SchemaElement> schema, Set<List<String>> variantPaths)
     {
         Iterator<SchemaElement> schemaIterator = schema.iterator();
         SchemaElement rootSchema = schemaIterator.next();
         Types.MessageTypeBuilder builder = Types.buildMessage();
-        readTypeSchema(builder, schemaIterator, rootSchema.getNum_children());
+        readTypeSchema(builder, schemaIterator, rootSchema.getNum_children(), false, ImmutableList.of(), variantPaths);
         return builder.named(rootSchema.name);
     }
 
-    private static void readTypeSchema(Types.GroupBuilder<?> builder, Iterator<SchemaElement> schemaIterator, int typeCount)
+    /**
+     * Column names are lowercased, as Hive does, except below a VARIANT group ({@code preserveCase}): there a name is
+     * the key of a shredded object field, which is case-sensitive and must reach the reader as the file spells it.
+     * The paths of the VARIANT groups, as the file spells them, are added to {@code variantPaths}.
+     */
+    private static void readTypeSchema(Types.GroupBuilder<?> builder, Iterator<SchemaElement> schemaIterator, int typeCount, boolean preserveCase, List<String> parentPath, Set<List<String>> variantPaths)
     {
         for (int i = 0; i < typeCount; i++) {
             SchemaElement element = schemaIterator.next();
             Types.Builder<?, ?> typeBuilder;
             if (element.type == null) {
                 typeBuilder = builder.group(Type.Repetition.valueOf(element.repetition_type.name()));
-                readTypeSchema((Types.GroupBuilder<?>) typeBuilder, schemaIterator, element.num_children);
+                List<String> path = ImmutableList.<String>builderWithExpectedSize(parentPath.size() + 1).addAll(parentPath).add(element.name).build();
+                boolean variantGroup = isVariantGroup(element);
+                if (variantGroup && !preserveCase) {
+                    variantPaths.add(path);
+                }
+                readTypeSchema((Types.GroupBuilder<?>) typeBuilder, schemaIterator, element.num_children, preserveCase || variantGroup, path, variantPaths);
             }
             else {
                 Types.PrimitiveBuilder<?> primitiveBuilder = builder.primitive(getPrimitive(element.type), Type.Repetition.valueOf(element.repetition_type.name()));
@@ -295,7 +306,7 @@ public class ParquetMetadata
             if (element.isSetField_id()) {
                 typeBuilder.id(element.field_id);
             }
-            typeBuilder.named(element.name.toLowerCase(Locale.ENGLISH));
+            typeBuilder.named(preserveCase ? element.name : element.name.toLowerCase(Locale.ENGLISH));
         }
     }
 
@@ -315,12 +326,31 @@ public class ParquetMetadata
         return Optional.of(Util.readColumnMetaData(tempInputStream, columnDecryptionContext.get().metadataDecryptor(), columnMetaDataAAD));
     }
 
-    private static ColumnPath getPath(List<String> pathInSchema)
+    private static boolean isVariantGroup(SchemaElement element)
+    {
+        return element.type == null && element.isSetLogicalType() && element.logicalType.isSetVARIANT();
+    }
+
+    /**
+     * The column's path as {@link #readParquetSchema} names it: lowercased, except below a VARIANT group. A file with no
+     * VARIANT group lowercases every element, as it always has.
+     */
+    private static ColumnPath getPath(Set<List<String>> variantPaths, List<String> pathInSchema)
     {
         requireNonNull(pathInSchema, "pathInSchema is null");
-        String[] path = pathInSchema.stream()
-                .map(value -> value.toLowerCase(Locale.ENGLISH))
-                .toArray(String[]::new);
+        int preservedFrom = pathInSchema.size();
+        if (!variantPaths.isEmpty()) {
+            for (int length = 1; length < pathInSchema.size(); length++) {
+                if (variantPaths.contains(pathInSchema.subList(0, length))) {
+                    preservedFrom = length;
+                    break;
+                }
+            }
+        }
+        String[] path = new String[pathInSchema.size()];
+        for (int i = 0; i < path.length; i++) {
+            path[i] = i < preservedFrom ? pathInSchema.get(i).toLowerCase(Locale.ENGLISH) : pathInSchema.get(i);
+        }
         return ColumnPath.get(path);
     }
 
@@ -342,7 +372,7 @@ public class ParquetMetadata
         Iterator<SchemaElement> schemaIterator = schema.iterator();
         SchemaElement rootSchema = schemaIterator.next();
         Types.MessageTypeBuilder builder = Types.buildMessage();
-        readTypeSchema(builder, schemaIterator, rootSchema.getNum_children());
+        readTypeSchema(builder, schemaIterator, rootSchema.getNum_children(), false, ImmutableList.of(), new HashSet<>());
         return builder.named(rootSchema.name);
     }
 

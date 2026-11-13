@@ -17,6 +17,7 @@ import com.google.common.collect.ImmutableList;
 import io.trino.spi.TrinoException;
 import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.DecimalType;
+import io.trino.spi.type.Decimals;
 import io.trino.spi.type.MapType;
 import io.trino.spi.type.RowType;
 import io.trino.spi.type.Type;
@@ -29,8 +30,19 @@ import org.apache.parquet.io.GroupColumnIO;
 import org.apache.parquet.io.MessageColumnIO;
 import org.apache.parquet.io.PrimitiveColumnIO;
 import org.apache.parquet.schema.GroupType;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.DateLogicalTypeAnnotation;
 import org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.ListLogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.StringLogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.TimeLogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.UUIDLogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.VariantLogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType;
+import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 
 import java.math.BigInteger;
 import java.util.Arrays;
@@ -41,8 +53,23 @@ import java.util.Optional;
 
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
+import static io.trino.spi.type.BigintType.BIGINT;
+import static io.trino.spi.type.BooleanType.BOOLEAN;
+import static io.trino.spi.type.DateType.DATE;
+import static io.trino.spi.type.DoubleType.DOUBLE;
+import static io.trino.spi.type.IntegerType.INTEGER;
+import static io.trino.spi.type.RealType.REAL;
+import static io.trino.spi.type.SmallintType.SMALLINT;
 import static io.trino.spi.type.StandardTypes.JSON;
+import static io.trino.spi.type.TimeType.TIME_MICROS;
+import static io.trino.spi.type.TimestampType.TIMESTAMP_MICROS;
+import static io.trino.spi.type.TimestampType.TIMESTAMP_NANOS;
+import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS;
+import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_NANOS;
+import static io.trino.spi.type.TinyintType.TINYINT;
+import static io.trino.spi.type.UuidType.UUID;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
+import static io.trino.spi.type.VarcharType.VARCHAR;
 import static io.trino.spi.type.VariantType.VARIANT;
 import static java.lang.String.format;
 import static org.apache.parquet.schema.Type.Repetition.OPTIONAL;
@@ -300,6 +327,12 @@ public final class ParquetTypeUtils
             if (!(columnIO instanceof GroupColumnIO groupColumnIo)) {
                 throw new IllegalStateException("Expected columnIO to be GroupColumnIO but got %s".formatted(columnIO.getClass().getSimpleName()));
             }
+            if (type == VARIANT) {
+                checkShreddedChildren(columnPath(groupColumnIo), groupColumnIo.getType().asGroupType(), true);
+            }
+            if (type == VARIANT && groupColumnIo.getChild(ShreddedVariantField.TYPED_VALUE) != null) {
+                return Optional.of(constructShreddedVariantField(type, groupColumnIo));
+            }
             PrimitiveField valueField = (PrimitiveField) constructField(VARBINARY, groupColumnIo.getChild("value"), false).orElseThrow();
             PrimitiveField metadataField = (PrimitiveField) constructField(VARBINARY, groupColumnIo.getChild("metadata"), false).orElseThrow();
             if (type == VARIANT) {
@@ -378,10 +411,347 @@ public final class ParquetTypeUtils
 
     private static boolean isVariantType(Type type, ColumnIO columnIO)
     {
-        return (type == VARIANT || type.getBaseName().equals(JSON)) &&
-                columnIO instanceof GroupColumnIO groupColumnIo &&
+        if (!(columnIO instanceof GroupColumnIO groupColumnIo)) {
+            return false;
+        }
+        if (type == VARIANT) {
+            return groupColumnIo.getChild(ShreddedVariantField.METADATA) != null &&
+                    (groupColumnIo.getChild(ShreddedVariantField.VALUE) != null || groupColumnIo.getChild(ShreddedVariantField.TYPED_VALUE) != null);
+        }
+        return type.getBaseName().equals(JSON) &&
                 groupColumnIo.getChildrenCount() == 2 &&
                 groupColumnIo.getChild("value") != null &&
                 groupColumnIo.getChild("metadata") != null;
     }
+
+    /**
+     * Builds the field tree for a shredded VARIANT column (a group with {@code metadata}, an optional
+     * {@code value}, and a {@code typed_value} child) per the Parquet Variant shredding spec. The
+     * shredded columns are modeled as a synthesized {@code RowType} struct mirroring the Parquet
+     * layout so the standard nested readers can materialize them; the {@code typed_value} subtree is
+     * navigated by exact name (variant field names are case-sensitive).
+     */
+    public static ShreddedVariantField constructShreddedVariantField(Type variantType, GroupColumnIO variantColumnIo)
+    {
+        checkShreddedLayout(columnPath(variantColumnIo), variantColumnIo.getType().asGroupType());
+        NodeField node = buildShreddedNode(variantColumnIo, true);
+        if (!(node.field() instanceof GroupField struct)) {
+            throw shreddedLayoutException(variantColumnIo, "the variant is not a group");
+        }
+        return new ShreddedVariantField(
+                variantType,
+                variantColumnIo.getRepetitionLevel(),
+                variantColumnIo.getDefinitionLevel(),
+                variantColumnIo.getType().getRepetition() != OPTIONAL,
+                struct,
+                columnPath(variantColumnIo));
+    }
+
+    /**
+     * Checks the whole shape of a shredded VARIANT group against the schema alone, throwing the {@link ShreddedLayoutException}
+     * the reader throws for a layout it cannot read. The reader runs it before building fields, and a pruned read
+     * runs it on the file's full group, so both reject exactly the same files.
+     */
+    public static void checkShreddedLayout(String columnPath, GroupType variantGroup)
+    {
+        checkShreddedNode(columnPath, variantGroup, true);
+        // The footer lowercases schema names except below a group annotated VARIANT, so without the annotation the case of
+        // a shredded object field's name, which is the key it reads as, cannot be recovered
+        if (!(variantGroup.getLogicalTypeAnnotation() instanceof VariantLogicalTypeAnnotation) &&
+                variantGroup.containsField(ShreddedVariantField.TYPED_VALUE) &&
+                containsObjectFields(variantGroup.getType(ShreddedVariantField.TYPED_VALUE))) {
+            throw shreddedLayoutException(columnPath, "the group lacks the VARIANT logical type annotation, which is required to read shredded object fields because the case of their names cannot be recovered without it");
+        }
+    }
+
+    private static void checkShreddedNode(String path, GroupType node, boolean topLevel)
+    {
+        if (!node.containsField(ShreddedVariantField.VALUE) && !node.containsField(ShreddedVariantField.TYPED_VALUE)) {
+            throw shreddedLayoutException(path, "group has neither value nor typed_value");
+        }
+        checkShreddedChildren(path, node, topLevel);
+
+        if (topLevel) {
+            if (!node.containsField(ShreddedVariantField.METADATA) || !isBinary(node.getType(ShreddedVariantField.METADATA))) {
+                throw shreddedLayoutException(path, "metadata is not a binary column");
+            }
+        }
+        if (node.containsField(ShreddedVariantField.VALUE)) {
+            org.apache.parquet.schema.Type value = node.getType(ShreddedVariantField.VALUE);
+            if (!isBinary(value)) {
+                throw shreddedLayoutException(path + "." + ShreddedVariantField.VALUE, "value is not a binary column");
+            }
+        }
+        if (node.containsField(ShreddedVariantField.TYPED_VALUE)) {
+            checkShreddedTypedValue(path + "." + ShreddedVariantField.TYPED_VALUE, node.getType(ShreddedVariantField.TYPED_VALUE));
+        }
+    }
+
+    private static void checkShreddedTypedValue(String path, org.apache.parquet.schema.Type typedValue)
+    {
+        if (typedValue.isPrimitive()) {
+            shreddedScalarType(path, typedValue.asPrimitiveType());
+            return;
+        }
+        GroupType group = typedValue.asGroupType();
+        if (group.getLogicalTypeAnnotation() instanceof ListLogicalTypeAnnotation) {
+            // Only the standard three-level list: LIST group, one repeated group, one element group inside it
+            if (group.getFieldCount() != 1 ||
+                    group.getType(0).isPrimitive() ||
+                    group.getType(0).getRepetition() != REPEATED ||
+                    group.getType(0).asGroupType().getFieldCount() != 1 ||
+                    !group.getType(0).asGroupType().getType(0).getName().equals("element") ||
+                    group.getType(0).asGroupType().getType(0).isPrimitive()) {
+                throw shreddedLayoutException(path, "array is not a three-level list (LIST group, repeated group, element group)");
+            }
+            GroupType repeated = group.getType(0).asGroupType();
+            checkShreddedNode(path + "." + repeated.getName() + ".element", repeated.getType(0).asGroupType(), false);
+            return;
+        }
+        if (group.getFieldCount() == 0) {
+            throw shreddedLayoutException(path, "object has no fields");
+        }
+        for (org.apache.parquet.schema.Type field : group.getFields()) {
+            String fieldPath = path + "." + field.getName();
+            if (field.isPrimitive()) {
+                throw shreddedLayoutException(fieldPath, "object field '%s' is not a group holding value and typed_value".formatted(field.getName()));
+            }
+            checkShreddedNode(fieldPath, field.asGroupType(), false);
+        }
+    }
+
+    // True when the typed_value holds an object (a group with named fields) at any depth, arrays included
+    private static boolean containsObjectFields(org.apache.parquet.schema.Type typedValue)
+    {
+        if (typedValue.isPrimitive()) {
+            return false;
+        }
+        GroupType group = typedValue.asGroupType();
+        if (group.getLogicalTypeAnnotation() instanceof ListLogicalTypeAnnotation) {
+            // The list's shape was checked by checkShreddedTypedValue
+            GroupType element = group.getType(0).asGroupType().getType(0).asGroupType();
+            return element.containsField(ShreddedVariantField.TYPED_VALUE) &&
+                    containsObjectFields(element.getType(ShreddedVariantField.TYPED_VALUE));
+        }
+        return true;
+    }
+
+    /**
+     * The one error for a shredded VARIANT layout this reader cannot read, naming the Parquet column path.
+     */
+    public static ShreddedLayoutException shreddedLayoutException(String columnPath, String detail)
+    {
+        return new ShreddedLayoutException(columnPath, detail, null);
+    }
+
+    public static ShreddedLayoutException shreddedLayoutException(String columnPath, String detail, Throwable cause)
+    {
+        return new ShreddedLayoutException(columnPath, detail, cause);
+    }
+
+    private static ShreddedLayoutException shreddedLayoutException(ColumnIO columnIo, String detail)
+    {
+        return shreddedLayoutException(columnPath(columnIo), detail);
+    }
+
+    private static String columnPath(ColumnIO columnIo)
+    {
+        return String.join(".", columnIo.getFieldPath());
+    }
+
+    /**
+     * A variant node holds only {@code value} and {@code typed_value}, and the top-level variant also {@code metadata};
+     * anything else is not a layout this reader understands, and would otherwise be ignored silently.
+     */
+    private static void checkShreddedChildren(String path, GroupType group, boolean topLevel)
+    {
+        for (org.apache.parquet.schema.Type child : group.getFields()) {
+            String name = child.getName();
+            boolean known = name.equals(ShreddedVariantField.VALUE) ||
+                    name.equals(ShreddedVariantField.TYPED_VALUE) ||
+                    (topLevel && name.equals(ShreddedVariantField.METADATA));
+            if (!known) {
+                throw shreddedLayoutException(path, "unexpected child '%s' beside value and typed_value".formatted(name));
+            }
+        }
+    }
+
+    private static NodeField buildShreddedNode(GroupColumnIO nodeColumnIo, boolean topLevel)
+    {
+        ImmutableList.Builder<RowType.Field> typeFields = ImmutableList.builder();
+        ImmutableList.Builder<Optional<Field>> childFields = ImmutableList.builder();
+
+        // The shape was checked by checkShreddedLayout
+        if (topLevel) {
+            PrimitiveColumnIO metadata = (PrimitiveColumnIO) nodeColumnIo.getChild(ShreddedVariantField.METADATA);
+            typeFields.add(RowType.field(ShreddedVariantField.METADATA, VARBINARY));
+            childFields.add(Optional.of(shreddedPrimitiveField(VARBINARY, metadata)));
+        }
+
+        ColumnIO valueColumnIo = nodeColumnIo.getChild(ShreddedVariantField.VALUE);
+        if (valueColumnIo != null) {
+            PrimitiveColumnIO value = (PrimitiveColumnIO) valueColumnIo;
+            typeFields.add(RowType.field(ShreddedVariantField.VALUE, VARBINARY));
+            childFields.add(Optional.of(shreddedPrimitiveField(VARBINARY, value)));
+        }
+
+        ColumnIO typedValueColumnIo = nodeColumnIo.getChild(ShreddedVariantField.TYPED_VALUE);
+        if (typedValueColumnIo != null) {
+            NodeField typedValue = buildShreddedTypedValue(typedValueColumnIo);
+            typeFields.add(RowType.field(ShreddedVariantField.TYPED_VALUE, typedValue.type()));
+            childFields.add(Optional.of(typedValue.field()));
+        }
+
+        RowType rowType = RowType.from(typeFields.build());
+        GroupField group = new GroupField(
+                rowType,
+                nodeColumnIo.getRepetitionLevel(),
+                nodeColumnIo.getDefinitionLevel(),
+                nodeColumnIo.getType().getRepetition() != OPTIONAL,
+                childFields.build());
+        return new NodeField(rowType, group);
+    }
+
+    private static boolean isBinary(org.apache.parquet.schema.Type type)
+    {
+        return type.isPrimitive() && type.asPrimitiveType().getPrimitiveTypeName() == PrimitiveTypeName.BINARY;
+    }
+
+    private static NodeField buildShreddedTypedValue(ColumnIO typedValueColumnIo)
+    {
+        if (typedValueColumnIo instanceof PrimitiveColumnIO primitive) {
+            Type type = shreddedScalarType(columnPath(primitive), primitive.getType().asPrimitiveType());
+            return new NodeField(type, shreddedPrimitiveField(type, primitive));
+        }
+        GroupColumnIO group = (GroupColumnIO) typedValueColumnIo;
+        if (group.getType().getLogicalTypeAnnotation() instanceof ListLogicalTypeAnnotation) {
+            GroupColumnIO repeated = (GroupColumnIO) group.getChild(0);
+            GroupColumnIO elementColumnIo = (GroupColumnIO) repeated.getChild(0);
+            NodeField element = buildShreddedNode(elementColumnIo, false);
+            ArrayType arrayType = new ArrayType(element.type());
+            GroupField field = new GroupField(
+                    arrayType,
+                    group.getRepetitionLevel(),
+                    group.getDefinitionLevel(),
+                    group.getType().getRepetition() != OPTIONAL,
+                    ImmutableList.of(Optional.of(element.field())));
+            return new NodeField(arrayType, field);
+        }
+
+        ImmutableList.Builder<RowType.Field> typeFields = ImmutableList.builder();
+        ImmutableList.Builder<Optional<Field>> childFields = ImmutableList.builder();
+        for (int i = 0; i < group.getChildrenCount(); i++) {
+            GroupColumnIO fieldColumnIo = (GroupColumnIO) group.getChild(i);
+            NodeField node = buildShreddedNode(fieldColumnIo, false);
+            typeFields.add(RowType.field(fieldColumnIo.getName(), node.type()));
+            childFields.add(Optional.of(node.field()));
+        }
+        RowType rowType = RowType.from(typeFields.build());
+        GroupField field = new GroupField(
+                rowType,
+                group.getRepetitionLevel(),
+                group.getDefinitionLevel(),
+                group.getType().getRepetition() != OPTIONAL,
+                childFields.build());
+        return new NodeField(rowType, field);
+    }
+
+    private static PrimitiveField shreddedPrimitiveField(Type type, PrimitiveColumnIO columnIo)
+    {
+        return new PrimitiveField(type, columnIo.getType().getRepetition() != OPTIONAL, columnIo.getColumnDescriptor(), columnIo.getId());
+    }
+
+    private static Type shreddedScalarType(String columnPath, PrimitiveType columnIo)
+    {
+        LogicalTypeAnnotation annotation = columnIo.getLogicalTypeAnnotation();
+        PrimitiveTypeName physicalType = columnIo.getPrimitiveTypeName();
+        return switch (physicalType) {
+            case BOOLEAN -> BOOLEAN;
+            case FLOAT -> REAL;
+            case DOUBLE -> DOUBLE;
+            case INT32 -> {
+                if (annotation instanceof DateLogicalTypeAnnotation) {
+                    yield DATE;
+                }
+                if (annotation instanceof DecimalLogicalTypeAnnotation decimal) {
+                    yield shreddedDecimalType(columnPath, columnIo, decimal);
+                }
+                if (annotation instanceof IntLogicalTypeAnnotation integer) {
+                    if (!integer.isSigned()) {
+                        throw unsupportedShreddedScalar(columnPath, columnIo);
+                    }
+                    yield switch (integer.getBitWidth()) {
+                        case 8 -> TINYINT;
+                        case 16 -> SMALLINT;
+                        default -> INTEGER;
+                    };
+                }
+                if (annotation instanceof TimeLogicalTypeAnnotation) {
+                    // TIME(MILLIS) is not a shredded Variant type
+                    throw unsupportedShreddedScalar(columnPath, columnIo);
+                }
+                yield INTEGER;
+            }
+            case INT64 -> {
+                if (annotation instanceof DecimalLogicalTypeAnnotation decimal) {
+                    yield shreddedDecimalType(columnPath, columnIo, decimal);
+                }
+                if (annotation instanceof IntLogicalTypeAnnotation integer && !integer.isSigned()) {
+                    throw unsupportedShreddedScalar(columnPath, columnIo);
+                }
+                if (annotation instanceof TimeLogicalTypeAnnotation time) {
+                    if (time.isAdjustedToUTC() || time.getUnit() != LogicalTypeAnnotation.TimeUnit.MICROS) {
+                        throw unsupportedShreddedScalar(columnPath, columnIo);
+                    }
+                    yield TIME_MICROS;
+                }
+                if (annotation instanceof TimestampLogicalTypeAnnotation timestamp) {
+                    yield switch (timestamp.getUnit()) {
+                        case MICROS -> timestamp.isAdjustedToUTC() ? TIMESTAMP_TZ_MICROS : TIMESTAMP_MICROS;
+                        case NANOS -> timestamp.isAdjustedToUTC() ? TIMESTAMP_TZ_NANOS : TIMESTAMP_NANOS;
+                        case MILLIS -> throw unsupportedShreddedScalar(columnPath, columnIo);
+                    };
+                }
+                yield BIGINT;
+            }
+            case BINARY -> {
+                if (annotation instanceof DecimalLogicalTypeAnnotation decimal) {
+                    yield shreddedDecimalType(columnPath, columnIo, decimal);
+                }
+                if (annotation instanceof StringLogicalTypeAnnotation) {
+                    yield VARCHAR;
+                }
+                if (annotation != null) {
+                    // JSON, BSON, ENUM and the like are not shredded Variant types; reading them as raw binary would change the value's type
+                    throw unsupportedShreddedScalar(columnPath, columnIo);
+                }
+                yield VARBINARY;
+            }
+            case FIXED_LEN_BYTE_ARRAY -> {
+                if (annotation instanceof DecimalLogicalTypeAnnotation decimal) {
+                    yield shreddedDecimalType(columnPath, columnIo, decimal);
+                }
+                if (annotation instanceof UUIDLogicalTypeAnnotation && columnIo.getTypeLength() == 16) {
+                    yield UUID;
+                }
+                throw unsupportedShreddedScalar(columnPath, columnIo);
+            }
+            default -> throw unsupportedShreddedScalar(columnPath, columnIo);
+        };
+    }
+
+    private static Type shreddedDecimalType(String columnPath, PrimitiveType columnIo, DecimalLogicalTypeAnnotation decimal)
+    {
+        if (decimal.getPrecision() > Decimals.MAX_PRECISION || decimal.getScale() > decimal.getPrecision()) {
+            throw unsupportedShreddedScalar(columnPath, columnIo);
+        }
+        return DecimalType.createDecimalType(decimal.getPrecision(), decimal.getScale());
+    }
+
+    private static ShreddedLayoutException unsupportedShreddedScalar(String columnPath, PrimitiveType columnIo)
+    {
+        return shreddedLayoutException(columnPath, "unsupported typed_value type " + columnIo);
+    }
+
+    private record NodeField(Type type, Field field) {}
 }

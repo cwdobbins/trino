@@ -35,7 +35,10 @@ import io.trino.parquet.ParquetWriteValidation;
 import io.trino.parquet.ParquetWriteValidation.StatisticsValidation;
 import io.trino.parquet.ParquetWriteValidation.WriteChecksumBuilder;
 import io.trino.parquet.PrimitiveField;
+import io.trino.parquet.ShreddedLayoutException;
+import io.trino.parquet.ShreddedVariantField;
 import io.trino.parquet.VariantField;
+import io.trino.parquet.VariantPredicateField;
 import io.trino.parquet.crypto.FileDecryptionContext;
 import io.trino.parquet.metadata.ColumnChunkMetadata;
 import io.trino.parquet.metadata.PrunedBlockMetadata;
@@ -45,6 +48,7 @@ import io.trino.parquet.spark.Variant;
 import io.trino.plugin.base.metrics.LongCount;
 import io.trino.spi.Page;
 import io.trino.spi.block.ArrayBlock;
+import io.trino.spi.block.Bitmap;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.block.DictionaryBlock;
@@ -74,8 +78,10 @@ import org.joda.time.DateTimeZone;
 import java.io.Closeable;
 import java.io.IOException;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -99,6 +105,7 @@ import static io.trino.parquet.ParquetWriteValidation.WriteChecksumBuilder.creat
 import static io.trino.parquet.reader.ListColumnReader.calculateCollectionOffsets;
 import static io.trino.parquet.reader.PageReader.createPageReader;
 import static io.trino.spi.block.Bitmap.isSet;
+import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
 import static io.trino.spi.type.VariantType.VARIANT;
 import static java.lang.Math.max;
@@ -136,6 +143,10 @@ public class ParquetReader
     private final List<Column> columnFields;
     private final boolean appendRowNumberColumn;
     private final List<PrimitiveField> primitiveFields;
+    // ColumnIO IDs belong to a requested schema view. Use physical descriptors across views.
+    private final Map<ColumnDescriptor, Integer> physicalColumnIds;
+    private final Map<Integer, VariantReadBatch> variantBatchesByColumn;
+    private final List<VariantReadBatch> variantBatches;
     private final ParquetDataSource dataSource;
     private final ZoneId zoneId;
     private final ColumnReaderFactory columnReaderFactory;
@@ -178,6 +189,14 @@ public class ParquetReader
     private int completedRowGroupDataPageReadCount;
     private int selectedPositionsFallbackCount;
     private int selectedPositionsPushdownCount;
+    // For tests only (see shreddedVariantRowsReconstructed()): rows of top-level and nested shredded VARIANT columns
+    // reconstructed for the current batch, reset with each batch
+    private long shreddedVariantRowsReconstructed;
+    private long variantLeafDecodes;
+    private long variantLeafDecodeNanos;
+    private long variantOutputRows;
+    private long variantOutputReconstructionNanos;
+    private long variantDecisionNanos;
 
     private long columnIndexRowsFiltered = -1;
     private final Optional<FileDecryptionContext> decryptionContext;
@@ -235,6 +254,11 @@ public class ParquetReader
         this.columnFields = ImmutableList.copyOf(columnFields);
         this.appendRowNumberColumn = appendRowNumberColumn;
         this.primitiveFields = getPrimitiveFields(columnFields.stream().map(Column::field).collect(toImmutableList()));
+        ImmutableMap.Builder<ColumnDescriptor, Integer> physicalColumnIds = ImmutableMap.builder();
+        for (int index = 0; index < primitiveFields.size(); index++) {
+            physicalColumnIds.put(primitiveFields.get(index).getDescriptor(), index);
+        }
+        this.physicalColumnIds = physicalColumnIds.buildOrThrow();
         this.rowGroups = requireNonNull(rowGroups, "rowGroups is null");
         this.dataSource = requireNonNull(dataSource, "dataSource is null");
         this.zoneId = requireNonNull(timeZone, "timeZone is null").toTimeZone().toZoneId();
@@ -272,7 +296,7 @@ public class ParquetReader
             PrunedBlockMetadata blockMetadata = rowGroups.get(rowGroup).prunedBlockMetadata();
             long rowGroupRowCount = blockMetadata.getRowCount();
             for (PrimitiveField field : primitiveFields) {
-                int columnId = field.getId();
+                int columnId = physicalColumnId(field);
                 ColumnChunkMetadata chunkMetadata = blockMetadata.getColumnChunkMetaData(field.getDescriptor());
                 ColumnPath columnPath = chunkMetadata.getPath();
 
@@ -307,12 +331,35 @@ public class ParquetReader
         }
         this.codecMetrics = ImmutableMap.copyOf(codecMetrics);
         this.chunkReaders = dataSource.planRead(ranges, memoryContext);
+        Map<List<String>, List<Field>> variantViews = new LinkedHashMap<>();
+        columnFields.forEach(column -> collectVariantViews(column.field(), variantViews));
+        List<VariantReadBatch> batches = new ArrayList<>();
+        ImmutableMap.Builder<Integer, VariantReadBatch> batchesByColumn = ImmutableMap.builder();
+        for (List<Field> views : variantViews.values()) {
+            List<PrimitiveField> leaves = getPrimitiveFields(views);
+            VariantReadBatch batch = new VariantReadBatch(
+                    leaves,
+                    field -> {
+                        long start = System.nanoTime();
+                        ColumnChunk chunk = readPrimitiveUncached(field, null);
+                        variantLeafDecodes++;
+                        variantLeafDecodeNanos += System.nanoTime() - start;
+                        return chunk;
+                    },
+                    memoryContext.newLocalMemoryContext(VariantReadBatch.class.getSimpleName()));
+            batches.add(batch);
+            leaves.forEach(field -> batchesByColumn.put(physicalColumnId(field), batch));
+        }
+        this.variantBatches = ImmutableList.copyOf(batches);
+        this.variantBatchesByColumn = batchesByColumn.buildOrThrow();
     }
 
     @Override
     public void close()
             throws IOException
     {
+        currentPageId++;
+        variantBatches.forEach(VariantReadBatch::close);
         // Release memory usage from column readers
         columnReaders.values().forEach(ColumnReader::close);
         columnReaders.clear();
@@ -332,12 +379,15 @@ public class ParquetReader
     public SourcePage nextPage()
             throws IOException
     {
+        // Invalidate borrowed pages before releasing the batch, including at EOF or on failure.
+        currentPageId++;
         int batchSize = nextBatch();
         if (batchSize <= 0) {
             return null;
         }
         // create a lazy page
-        currentPageId++;
+        // a test-only counter of the batch's reconstructed variant rows
+        shreddedVariantRowsReconstructed = 0;
         SourcePage page = new ParquetSourcePage(batchSize);
         validateWritePageChecksum(page);
         return page;
@@ -436,7 +486,7 @@ public class ParquetReader
                                 ? getSelectedPositionsReadMode(field, selectedPositions, unloadedSelectedColumns)
                                 : requireNonNull(selectedPositionsReadModes[channel], "selected positions read mode is null");
                         block = switch (readMode) {
-                            case FULL -> compactIfRetainingExcessData(selectedPositions.apply(readBlock(field)));
+                            case FULL -> compactIfRetainingExcessData(readSelected(field));
                             case PAGE -> compactIfRetainingExcessData(readPrimitivePageFiltered((PrimitiveField) field, selectedPositions).getBlock());
                             case ROW -> compactIfRetainingExcessData(readPrimitive((PrimitiveField) field, selectedPositions).getBlock());
                         };
@@ -560,6 +610,26 @@ public class ParquetReader
                     blocks[i] = block;
                 }
             }
+        }
+
+        /**
+         * Reads the whole field and applies the selection, except that a top-level shredded VARIANT is reconstructed for
+         * the selected rows only when the option allows: its columns are decoded for the whole batch, as before, and the
+         * block is the one the selection would have produced. A variant nested in another column is read by that
+         * column's reader and is unaffected.
+         */
+        private Block readSelected(Field field)
+                throws IOException
+        {
+            if (field instanceof VariantPredicateField predicateField) {
+                return readVariantPredicate(predicateField, selectedPositions);
+            }
+            if (field instanceof ShreddedVariantField shreddedVariantField
+                    && selectedPositions.hasPositions()
+                    && options.shreddedVariantSelectiveRebuild()) {
+                return readShreddedVariantSelected(shreddedVariantField, selectedPositions);
+            }
+            return selectedPositions.apply(readBlock(field));
         }
 
         private Block compactIfRetainingExcessData(Block block)
@@ -817,13 +887,13 @@ public class ParquetReader
         }
         if (primitiveField.getDescriptor().getPath().length != 1
                 || primitiveField.getRepetitionLevel() != 0
-                || !columnReaders.get(primitiveField.getId()).supportsSelectedPositions()) {
+                || !columnReaders.get(physicalColumnId(primitiveField)).supportsSelectedPositions()) {
             return SelectedPositionsReadMode.FULL;
         }
         if (forceSelectedPositionsPushdown) {
             return selectedPositions.strictlyAscending() ? SelectedPositionsReadMode.ROW : SelectedPositionsReadMode.FULL;
         }
-        SelectedPositionsPushdownCharacteristics characteristics = selectedPositionsPushdownCharacteristics.get(primitiveField.getId());
+        SelectedPositionsPushdownCharacteristics characteristics = selectedPositionsPushdownCharacteristics.get(physicalColumnId(primitiveField));
         if (characteristics == null) {
             ColumnChunkMetadata metadata = currentBlockMetadata.getColumnChunkMetaData(primitiveField.getDescriptor());
             long valueCount = metadata.getValueCount();
@@ -836,7 +906,7 @@ public class ParquetReader
                     valueCount == 0 ? 1 : max(1, metadata.getTotalUncompressedSize() / valueCount),
                     isOnlyDictionaryEncodingPages(metadata),
                     hasNulls);
-            selectedPositionsPushdownCharacteristics.put(primitiveField.getId(), characteristics);
+            selectedPositionsPushdownCharacteristics.put(physicalColumnId(primitiveField), characteristics);
         }
         boolean potentiallyRowSelectionBeneficial = isRowSelectionBeneficial(
                 batchSize,
@@ -1009,9 +1079,20 @@ public class ParquetReader
         return selectedPositionsPushdownCount;
     }
 
+    /**
+     * The number of rows of shredded VARIANT columns (top-level or nested) reconstructed for the current batch so far.
+     * The counter exists for tests, which use it to show that a selective rebuild reconstructs only selected rows.
+     */
+    @VisibleForTesting
+    long shreddedVariantRowsReconstructed()
+    {
+        return shreddedVariantRowsReconstructed;
+    }
+
     private int nextBatch()
             throws IOException
     {
+        variantBatches.forEach(VariantReadBatch::reset);
         if (nextRowInGroup >= currentGroupRowCount && !advanceToNextRowGroup()) {
             return -1;
         }
@@ -1086,7 +1167,7 @@ public class ParquetReader
         }
 
         for (PrimitiveField field : primitiveFields) {
-            ChunkedInputStream chunkedStream = chunkReaders.get(new ChunkKey(field.getId(), currentRowGroup));
+            ChunkedInputStream chunkedStream = chunkReaders.get(new ChunkKey(physicalColumnId(field), currentRowGroup));
             if (chunkedStream != null) {
                 chunkedStream.close();
             }
@@ -1117,6 +1198,89 @@ public class ParquetReader
 
         Block variantBlock = VariantBlock.create(positionsCount, metadataBlock, valueBlock, valueIsValid);
         return new ColumnChunk(variantBlock, metadataChunk.getDefinitionLevels(), metadataChunk.getRepetitionLevels());
+    }
+
+    /**
+     * Reads a shredded VARIANT column for every position of the batch, with the struct's definition and repetition
+     * levels, which describe those same positions.
+     */
+    private ColumnChunk readShreddedVariant(ShreddedVariantField field)
+            throws IOException
+    {
+        VariantReadView view = variantView(field);
+        ColumnChunk structChunk = view.chunk();
+        Block variantBlock = reconstructVariants(view, null);
+        return new ColumnChunk(variantBlock, structChunk.getDefinitionLevels(), structChunk.getRepetitionLevels());
+    }
+
+    /**
+     * Reads a top-level shredded VARIANT column under a selection: every leaf column for the whole batch, then the
+     * variants of the selected positions only, one position per selected position in the selection's order. Only a
+     * block is returned, since the struct's levels describe the whole batch, not these positions. With no position selected
+     * the struct is not read at all.
+     */
+    private Block readShreddedVariantSelected(ShreddedVariantField field, SelectedPositions selection)
+            throws IOException
+    {
+        requireNonNull(selection, "selection is null");
+        if (selection.positionCount() == 0) {
+            // Nothing is selected, so nothing is read: the column readers skip the batch's rows on their next read, as for
+            // any column that is not loaded in a batch
+            return VariantBlock.create(0, VARBINARY.createBlockBuilder(null, 0).build(), VARBINARY.createBlockBuilder(null, 0).build(), Optional.empty());
+        }
+        return reconstructVariants(variantView(field), selection);
+    }
+
+    VariantReadView variantView(ShreddedVariantField field)
+            throws IOException
+    {
+        PrimitiveField metadata = metadataField(field);
+        VariantReadBatch batch = requireNonNull(variantBatchesByColumn.get(physicalColumnId(metadata)), "Unknown VARIANT owner");
+        return batch.view(field, () -> readStruct(field.getStruct()));
+    }
+
+    private Block reconstructVariants(VariantReadView view, @Nullable SelectedPositions selection)
+    {
+        long start = System.nanoTime();
+        int positionCount = selection == null ? view.chunk().getBlock().getPositionCount() : selection.positionCount();
+        List<Optional<io.trino.spi.variant.Variant>> variants;
+        try {
+            ImmutableList.Builder<Optional<io.trino.spi.variant.Variant>> values = ImmutableList.builderWithExpectedSize(positionCount);
+            for (int row = 0; row < positionCount; row++) {
+                int originalPosition = selection == null ? row : selection.positions()[selection.positionsOffset() + row];
+                values.add(view.reconstructRow(originalPosition));
+            }
+            variants = values.build();
+            // counted for tests only
+            shreddedVariantRowsReconstructed += positionCount;
+            variantOutputRows += positionCount;
+        }
+        catch (ShreddedLayoutException e) {
+            // layouts differ from file to file, so name the file
+            throw e.inFile(dataSource.getId().toString());
+        }
+
+        BlockBuilder metadataBuilder = VARBINARY.createBlockBuilder(null, positionCount);
+        BlockBuilder valueBuilder = VARBINARY.createBlockBuilder(null, positionCount);
+        long[] valueIsValid = new long[Bitmap.wordsForBits(positionCount)];
+        boolean hasNull = false;
+        for (int position = 0; position < positionCount; position++) {
+            Optional<io.trino.spi.variant.Variant> variant = variants.get(position);
+            if (variant.isEmpty()) {
+                metadataBuilder.appendNull();
+                valueBuilder.appendNull();
+                hasNull = true;
+            }
+            else {
+                VARBINARY.writeSlice(metadataBuilder, variant.get().metadata().toSlice());
+                VARBINARY.writeSlice(valueBuilder, variant.get().data());
+                Bitmap.set(valueIsValid, 0, position);
+            }
+        }
+        Optional<long[]> validity = hasNull ? Optional.of(valueIsValid) : Optional.empty();
+        Block result = VariantBlock.create(positionCount, metadataBuilder.build(), valueBuilder.build(), validity);
+        variantOutputReconstructionNanos += System.nanoTime() - start;
+        return result;
     }
 
     private ColumnChunk readVariantAsJson(VariantField field)
@@ -1268,6 +1432,17 @@ public class ParquetReader
     private ColumnChunk readPrimitive(PrimitiveField field, @Nullable SelectedPositions selectedPositions)
             throws IOException
     {
+        VariantReadBatch batch = variantBatchesByColumn.get(physicalColumnId(field));
+        if (batch != null) {
+            checkArgument(selectedPositions == null, "VARIANT leaves require full-batch reads");
+            return batch.read(field);
+        }
+        return readPrimitiveUncached(field, selectedPositions);
+    }
+
+    private ColumnChunk readPrimitiveUncached(PrimitiveField field, @Nullable SelectedPositions selectedPositions)
+            throws IOException
+    {
         ColumnReader columnReader = initializeColumnReader(field);
         ColumnChunk columnChunk;
         if (selectedPositions != null && selectedPositions.positions() != null) {
@@ -1277,7 +1452,7 @@ public class ParquetReader
             columnChunk = columnReader.readPrimitive();
         }
 
-        updateMaxBytesPerCell(field.getId(), columnChunk);
+        updateMaxBytesPerCell(physicalColumnId(field), columnChunk);
         return columnChunk;
     }
 
@@ -1289,7 +1464,7 @@ public class ParquetReader
                 selectedPositions.positions(),
                 selectedPositions.positionsOffset(),
                 selectedPositions.positionCount());
-        updateMaxBytesPerCell(field.getId(), columnChunk);
+        updateMaxBytesPerCell(physicalColumnId(field), columnChunk);
         return columnChunk;
     }
 
@@ -1314,7 +1489,7 @@ public class ParquetReader
             throws IOException
     {
         ColumnDescriptor columnDescriptor = field.getDescriptor();
-        int fieldId = field.getId();
+        int fieldId = physicalColumnId(field);
         ColumnReader columnReader = columnReaders.get(fieldId);
         if (!columnReader.hasPageReader()) {
             validateParquet(currentBlockMetadata.getRowCount() > 0, dataSource.getId(), "Row group has 0 rows");
@@ -1350,6 +1525,15 @@ public class ParquetReader
         ImmutableMap.Builder<String, Metric<?>> metrics = ImmutableMap.<String, Metric<?>>builder()
                 .putAll(codecMetrics)
                 .put(SELECTED_POSITIONS_PUSHDOWNS, new LongCount(selectedPositionsPushdownCount));
+        if (!variantBatches.isEmpty()) {
+            metrics.put("Parquet VARIANT leaf decodes", new LongCount(variantLeafDecodes));
+            metrics.put("Parquet VARIANT leaf decode nanos", new LongCount(variantLeafDecodeNanos));
+            metrics.put("Parquet VARIANT output rows", new LongCount(variantOutputRows));
+            metrics.put("Parquet VARIANT output reconstruction nanos", new LongCount(variantOutputReconstructionNanos));
+            metrics.put("Parquet VARIANT decision nanos", new LongCount(variantDecisionNanos));
+            metrics.put("Parquet VARIANT reference reconstruction nanos", new LongCount(variantBatches.stream().mapToLong(VariantReadBatch::referenceReconstructionNanos).sum()));
+            metrics.put("Parquet VARIANT reference rows", new LongCount(variantBatches.stream().mapToLong(VariantReadBatch::referenceReconstructedRows).sum()));
+        }
         if (columnIndexRowsFiltered >= 0) {
             metrics.put(COLUMN_INDEX_ROWS_FILTERED, new LongCount(columnIndexRowsFiltered));
         }
@@ -1366,23 +1550,35 @@ public class ParquetReader
         selectedPositionsPushdownCharacteristics.clear();
         for (PrimitiveField field : primitiveFields) {
             columnReaders.put(
-                    field.getId(),
+                    physicalColumnId(field),
                     columnReaderFactory.create(field, currentRowGroupMemoryContext));
         }
     }
 
     public static List<PrimitiveField> getPrimitiveFields(List<Field> fields)
     {
-        Map<Integer, PrimitiveField> primitiveFields = new HashMap<>();
+        Map<ColumnDescriptor, PrimitiveField> primitiveFields = new LinkedHashMap<>();
         fields.forEach(field -> parseField(field, primitiveFields));
 
         return ImmutableList.copyOf(primitiveFields.values());
     }
 
-    private static void parseField(Field field, Map<Integer, PrimitiveField> primitiveFields)
+    private static void parseField(Field field, Map<ColumnDescriptor, PrimitiveField> primitiveFields)
     {
-        if (field instanceof PrimitiveField primitiveField) {
-            primitiveFields.put(primitiveField.getId(), primitiveField);
+        if (field instanceof VariantPredicateField predicateField) {
+            parseField(predicateField.source(), primitiveFields);
+        }
+        else if (field instanceof PrimitiveField primitiveField) {
+            PrimitiveField previous = primitiveFields.putIfAbsent(primitiveField.getDescriptor(), primitiveField);
+            if (previous != null) {
+                checkArgument(previous.getType().equals(primitiveField.getType())
+                                && previous.getDescriptor().getPrimitiveType().equals(primitiveField.getDescriptor().getPrimitiveType())
+                                && previous.getDefinitionLevel() == primitiveField.getDefinitionLevel()
+                                && previous.getRepetitionLevel() == primitiveField.getRepetitionLevel()
+                                && previous.isRequired() == primitiveField.isRequired(),
+                        "Incompatible views of physical Parquet column: %s",
+                        primitiveField.getDescriptor());
+            }
         }
         else if (field instanceof GroupField groupField) {
             groupField.getChildren().stream()
@@ -1393,19 +1589,108 @@ public class ParquetReader
             parseField(variantField.getValue(), primitiveFields);
             parseField(variantField.getMetadata(), primitiveFields);
         }
+        else if (field instanceof ShreddedVariantField shreddedVariantField) {
+            parseField(shreddedVariantField.getStruct(), primitiveFields);
+        }
+    }
+
+    private int physicalColumnId(PrimitiveField field)
+    {
+        return requireNonNull(physicalColumnIds.get(field.getDescriptor()), "Unknown physical column");
+    }
+
+    @VisibleForTesting
+    int variantLeavesDecoded()
+    {
+        return variantBatches.stream().mapToInt(VariantReadBatch::decodedLeaves).sum();
+    }
+
+    private static void collectVariantViews(Field field, Map<List<String>, List<Field>> views)
+    {
+        if (field instanceof VariantPredicateField predicateField) {
+            collectVariantViews(predicateField.source(), views);
+            return;
+        }
+        PrimitiveField metadata;
+        if (field instanceof ShreddedVariantField shredded) {
+            metadata = metadataField(shredded);
+        }
+        else if (field instanceof VariantField variant) {
+            metadata = (PrimitiveField) variant.getMetadata();
+        }
+        else {
+            if (field instanceof GroupField group) {
+                group.getChildren().stream().flatMap(Optional::stream).forEach(child -> collectVariantViews(child, views));
+            }
+            return;
+        }
+        List<String> path = ImmutableList.copyOf(metadata.getDescriptor().getPath());
+        views.computeIfAbsent(path.subList(0, path.size() - 1), _ -> new ArrayList<>()).add(field);
+    }
+
+    private static PrimitiveField metadataField(ShreddedVariantField field)
+    {
+        GroupField struct = field.getStruct();
+        RowType type = (RowType) struct.getType();
+        for (int index = 0; index < type.getFields().size(); index++) {
+            if (type.getFields().get(index).getName().orElse("").equals(ShreddedVariantField.METADATA)) {
+                return (PrimitiveField) struct.getChildren().get(index).orElseThrow();
+            }
+        }
+        throw new IllegalArgumentException("VARIANT metadata field is missing");
     }
 
     public Block readBlock(Field field)
             throws IOException
     {
+        if (field instanceof VariantPredicateField predicateField) {
+            return readVariantPredicate(predicateField, SelectedPositions.allPositions(batchSize));
+        }
         return readColumnChunk(field).getBlock();
+    }
+
+    private Block readVariantPredicate(VariantPredicateField field, SelectedPositions selection)
+            throws IOException
+    {
+        BlockBuilder result = TINYINT.createBlockBuilder(null, selection.positionCount());
+        if (selection.positionCount() == 0) {
+            return result.build();
+        }
+        try {
+            if (field.source() instanceof ShreddedVariantField shredded) {
+                VariantBatchAccess view = variantView(shredded);
+                long start = System.nanoTime();
+                for (int row = 0; row < selection.positionCount(); row++) {
+                    int position = selection.hasPositions() ? selection.positions()[selection.positionsOffset() + row] : row;
+                    TINYINT.writeLong(result, requireNonNull(field.evaluator().evaluate(view, position), "decision is null").code());
+                }
+                variantDecisionNanos += System.nanoTime() - start;
+            }
+            else {
+                Block values = readBlock(field.source());
+                long start = System.nanoTime();
+                for (int row = 0; row < selection.positionCount(); row++) {
+                    int position = selection.hasPositions() ? selection.positions()[selection.positionsOffset() + row] : row;
+                    TINYINT.writeLong(result, requireNonNull(field.evaluator().evaluateReference(
+                            values.isNull(position) ? null : VARIANT.getObject(values, position)), "decision is null").code());
+                }
+                variantDecisionNanos += System.nanoTime() - start;
+            }
+        }
+        catch (ShreddedLayoutException e) {
+            throw e.inFile(dataSource.getId().toString());
+        }
+        return result.build();
     }
 
     private ColumnChunk readColumnChunk(Field field)
             throws IOException
     {
         ColumnChunk columnChunk;
-        if (field instanceof VariantField variantField) {
+        if (field instanceof ShreddedVariantField shreddedVariantField) {
+            columnChunk = readShreddedVariant(shreddedVariantField);
+        }
+        else if (field instanceof VariantField variantField) {
             if (variantField.getType() == VARIANT) {
                 // Directly read VARIANT as a single block
                 columnChunk = readVariant(variantField);
